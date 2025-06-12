@@ -41,7 +41,7 @@ A sophisticated vLLM-based OpenAI-compatible API server that automatically selec
 3. **Clone and run** 🏃‍♂️:
    ```bash
    git clone https://github.com/realblehhguh/modal-vllm-server.git
-   cd your-repo-name
+   cd modal-vllm-server
    modal run vllmserver.py::chat
    ```
 
