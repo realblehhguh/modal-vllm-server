@@ -1,6 +1,6 @@
 # 🚀 Run LLMs on Modal with vLLM!
 ---
-**Made with AI (yes I vibe coded this but dont worry I tested my code)**
+**Run LLMs in less than 3 minutes!**
 
 [![GitHub stars](https://img.shields.io/github/stars/realblehhguh/modal-vllm-server?style=social)](https://github.com/yourusername/your-repo-name)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
@@ -16,7 +16,7 @@ A sophisticated vLLM-based OpenAI-compatible API server that automatically selec
 - ☁️ **Modal Integration**: Seamless deployment on Modal's serverless GPU infrastructure
 - 📦 **Model Management**: Easy model downloading and caching
 - 🔄 **OpenAI Compatible**: Drop-in replacement for OpenAI API
-
+- 📦 **Modal Volumes**: Save time from downloading models
 ## 🚀 Quick Start
 
 ### 📋 Prerequisites
@@ -384,4 +384,4 @@ This project was inspired by the need for a simple, automated way to deploy LLMs
 
 ---
 
-**Built with ❤️ by the community, for the community** 🌍
+**Built with ❤️ by the community, for the community** 🌍mode
