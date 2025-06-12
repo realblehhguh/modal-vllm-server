@@ -698,7 +698,7 @@ def run_chat_a100_40gb(model_name: str, custom_questions: Optional[list] = None,
     return run_chat_logic(model_name, custom_questions, api_only)
 
 @app.function(
-    gpu="A100:8", 
+    gpu="A100-80GB", 
     image=base_image, 
     secrets=[modal.Secret.from_name("huggingface")], 
     timeout=3600,
