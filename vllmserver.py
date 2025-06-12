@@ -4,6 +4,7 @@ import sys
 import time
 from pathlib import Path
 from typing import Optional
+import json
 
 import modal
 
@@ -20,6 +21,35 @@ def get_model_info(model_name: str):
     model_base_path = Path("/model")
     model_path = model_base_path / model_name.split("/")[-1]
     return volume_name, model_base_path, model_path
+
+def get_model_config(model_path: Path):
+    """Read model config to get actual limits"""
+    config_path = model_path / "config.json"
+    if config_path.exists():
+        try:
+            with open(config_path, 'r') as f:
+                config = json.load(f)
+            
+            # Extract key parameters
+            max_position_embeddings = config.get("max_position_embeddings", None)
+            model_max_length = config.get("model_max_length", None) or config.get("max_sequence_length", None)
+            vocab_size = config.get("vocab_size", None)
+            hidden_size = config.get("hidden_size", None)
+            model_type = config.get("model_type", "unknown")
+            
+            print(f"📖 Model config: type={model_type}, max_pos_emb={max_position_embeddings}, max_len={model_max_length}")
+            
+            return {
+                "max_position_embeddings": max_position_embeddings,
+                "model_max_length": model_max_length,
+                "vocab_size": vocab_size,
+                "hidden_size": hidden_size,
+                "model_type": model_type
+            }
+        except Exception as e:
+            print(f"⚠️ Could not read model config: {e}")
+            return None
+    return None
 
 def download_model_to_path(model_name: str, model_path: Path):
     """Download model to specific path"""
@@ -55,10 +85,7 @@ def download_model_to_path(model_name: str, model_path: Path):
             snapshot_download(
                 repo_id=model_name,
                 local_dir=model_path,
-                local_dir_use_symlinks=False,
                 token=os.environ.get("HF_TOKEN"),
-                resume_download=True,
-                force_download=False,
             )
             print("✅ Download complete.")
             
@@ -98,12 +125,16 @@ def get_gpu_config(model_name: str):
     elif any(size in model_name_lower for size in ["3b", "4b", "6b"]):
         return "A10G", 0.8
     
+    # Chat/dialog models (usually medium sized)
+    elif any(term in model_name_lower for term in ["dialog", "chat", "gpt2", "dialo"]):
+        return "A10G", 0.8
+    
     # Default for unknown sizes
     else:
         return "A10G", 0.8
 
 # --- Dynamic vLLM configuration based on model ---
-def get_vllm_config(model_name: str, gpu_type: str):
+def get_vllm_config(model_name: str, gpu_type: str, model_config: dict = None):
     """Get vLLM configuration based on model and GPU"""
     config = {
         "max_model_len": 2048,
@@ -114,6 +145,20 @@ def get_vllm_config(model_name: str, gpu_type: str):
     }
     
     model_lower = model_name.lower()
+    
+    # Use actual model config if available
+    if model_config:
+        max_pos_emb = model_config.get("max_position_embeddings")
+        model_max_len = model_config.get("model_max_length")
+        
+        # Determine the actual maximum length we can use
+        if max_pos_emb:
+            # Use 90% of max_position_embeddings for safety
+            config["max_model_len"] = int(max_pos_emb * 0.9)
+        elif model_max_len:
+            config["max_model_len"] = min(model_max_len, 2048)
+        
+        print(f"🔧 Adjusted max_model_len to {config['max_model_len']} based on model config")
     
     # Detect quantization
     if "gptq" in model_lower:
@@ -129,22 +174,31 @@ def get_vllm_config(model_name: str, gpu_type: str):
     
     # Adjust based on model size
     if "70b" in model_lower:
-        config["max_model_len"] = 4096 if config["quantization"] else 2048
+        if not model_config:  # Only adjust if we don't have actual config
+            config["max_model_len"] = min(config["max_model_len"], 4096 if config["quantization"] else 2048)
         config["max_num_seqs"] = 8 if config["quantization"] else 4
         config["tensor_parallel_size"] = 2 if gpu_type in ["H100", "A100"] else 1
     elif any(size in model_lower for size in ["7b", "8b", "13b"]):
-        config["max_model_len"] = 8192 if config["quantization"] else 4096
+        if not model_config:
+            config["max_model_len"] = min(config["max_model_len"], 8192 if config["quantization"] else 4096)
         config["max_num_seqs"] = 16 if config["quantization"] else 8
     elif any(size in model_lower for size in ["3b", "4b", "6b"]):
-        config["max_model_len"] = 6144
+        if not model_config:
+            config["max_model_len"] = min(config["max_model_len"], 6144)
         config["max_num_seqs"] = 12
     elif any(size in model_lower for size in ["1b", "2b", "tinyllama"]):
-        config["max_model_len"] = 8192
+        if not model_config:
+            config["max_model_len"] = min(config["max_model_len"], 8192)
         config["max_num_seqs"] = 16
+    elif "dialog" in model_lower or "chat" in model_lower:
+        # Dialog models often have smaller context windows
+        if not model_config:
+            config["max_model_len"] = min(config["max_model_len"], 1024)
+        config["max_num_seqs"] = 8
     
     # Adjust based on GPU capabilities
     if gpu_type == "T4":
-        config["max_model_len"] = min(config["max_model_len"], 4096)
+        config["max_model_len"] = min(config["max_model_len"], 2048)
         config["max_num_seqs"] = min(config["max_num_seqs"], 8)
         config["dtype"] = "half"  # Force float16 for T4 compatibility
     elif gpu_type in ["A100", "H100"]:
@@ -152,28 +206,42 @@ def get_vllm_config(model_name: str, gpu_type: str):
     else:  # A10G and others
         config["dtype"] = "auto"  # vLLM 0.9+ handles dtype selection better
     
+    # Ensure minimum viable values
+    config["max_model_len"] = max(config["max_model_len"], 256)
+    
     return config
 
-# --- Updated container image with vLLM 0.9.1 ---
+# --- Container image with clean dependency resolution ---
 base_image = (
-    modal.Image.debian_slim(python_version="3.11")  # Updated to Python 3.11
+    modal.Image.debian_slim(python_version="3.11")
     .apt_install("curl", "git")
     .pip_install(
+        # Install PyTorch first with exact version for stability
+        "torch==2.5.1",
+        # Basic numerical dependencies
         "numpy<2.0",
-        "vllm==0.9.1",  # Updated to v0.9.1
-        "transformers==4.46.2",  # Latest transformers
-        "torch==2.5.1",  # Latest PyTorch
-        "accelerate==1.1.1",  # Updated accelerate
-        "openai==1.54.4",  # Latest OpenAI client
+        "packaging",
+        "wheel",
+    )
+    .pip_install(
+        # Install vLLM and let it resolve its own transformers version
+        "vllm==0.9.1",
+    )
+    .pip_install(
+        # Install remaining packages and let them auto-resolve versions
+        "accelerate",
+        "openai", 
         "huggingface_hub[hf_transfer]",
-        "tokenizers==0.20.3",  # Latest tokenizers
+        "tokenizers",
         "requests",
-        "auto-gptq>=0.7.1",  # Updated GPTQ support
-        "autoawq>=0.2.6",    # Updated AWQ support
-        "optimum>=1.23.0",   # Latest optimum
-        "scipy",             # Sometimes needed for quantized models
-        "sentencepiece",     # For some tokenizers
-        "protobuf",          # For some model formats
+        "auto-gptq>=0.7.1",
+        "autoawq>=0.2.6", 
+        "optimum",
+        "scipy",
+        "sentencepiece",
+        "protobuf",
+        "psutil",
+        "pynvml",
     )
 )
 
@@ -198,6 +266,9 @@ def run_chat_logic(model_name: str, custom_questions: Optional[list] = None):
     if not model_path.exists():
         raise RuntimeError(f"Model path {model_path} does not exist after download")
     
+    # Read model config after download
+    model_config = get_model_config(model_path)
+    
     # Show model files
     files = list(model_path.glob("*"))
     print(f"📁 Model directory contains {len(files)} files")
@@ -209,8 +280,8 @@ def run_chat_logic(model_name: str, custom_questions: Optional[list] = None):
         else:
             print(f"   ❌ {efile} (missing)")
     
-    # Get dynamic configuration
-    vllm_config = get_vllm_config(model_name, gpu_type)
+    # Get dynamic configuration with model config
+    vllm_config = get_vllm_config(model_name, gpu_type, model_config)
     
     # Build vLLM command with GPU-specific settings
     vllm_command = [
@@ -221,13 +292,13 @@ def run_chat_logic(model_name: str, custom_questions: Optional[list] = None):
         "--served-model-name", model_name,
         "--tensor-parallel-size", str(vllm_config["tensor_parallel_size"]),
         "--trust-remote-code",
-        "--max-model-len", str(min(vllm_config["max_model_len"], 4096)),  # Less conservative with 0.9.1
+        "--max-model-len", str(vllm_config["max_model_len"]),
         "--gpu-memory-utilization", str(gpu_memory_util),
-        "--max-num-batched-tokens", str(min(vllm_config["max_num_seqs"] * 512, 8192)),  # New parameter in 0.9+
+        "--max-num-batched-tokens", str(min(vllm_config["max_num_seqs"] * 256, vllm_config["max_model_len"] * 2)),
         "--disable-log-requests",
         "--tokenizer-mode", "auto",
         "--dtype", vllm_config["dtype"],
-        "--enable-prefix-caching",  # New optimization in 0.9+
+        "--enable-prefix-caching",
     ]
     
     # Add quantization if detected
@@ -237,10 +308,10 @@ def run_chat_logic(model_name: str, custom_questions: Optional[list] = None):
     
     # vLLM 0.9.1 specific optimizations
     if gpu_type in ["A100", "H100"]:
-        vllm_command.append("--enable-chunked-prefill")  # Better for large contexts
+        vllm_command.append("--enable-chunked-prefill")
     
     print("🚀 Starting vLLM server...")
-    print(f"⚙️ Config: max_len={min(vllm_config['max_model_len'], 4096)}, batched_tokens={min(vllm_config['max_num_seqs'] * 512, 8192)}, dtype={vllm_config['dtype']}")
+    print(f"⚙️ Config: max_len={vllm_config['max_model_len']}, batched_tokens={min(vllm_config['max_num_seqs'] * 256, vllm_config['max_model_len'] * 2)}, dtype={vllm_config['dtype']}")
     if vllm_config["quantization"]:
         print(f"🗜️ Quantization: {vllm_config['quantization']}")
     
@@ -248,6 +319,9 @@ def run_chat_logic(model_name: str, custom_questions: Optional[list] = None):
     env = os.environ.copy()
     env["VLLM_USE_MODELSCOPE"] = "False"
     env["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+    env["CUDA_VISIBLE_DEVICES"] = "0"
+    # Allow overriding max model len if needed (though we shouldn't need this now)
+    env["VLLM_ALLOW_LONG_MAX_MODEL_LEN"] = "1"
     
     vllm_process = subprocess.Popen(
         vllm_command, 
@@ -258,7 +332,7 @@ def run_chat_logic(model_name: str, custom_questions: Optional[list] = None):
         env=env
     )
     
-    # Wait for startup with better monitoring
+    # Wait for startup with monitoring
     max_retries = 240  # 8 minutes for larger models
     output_lines = []
     
@@ -281,15 +355,14 @@ def run_chat_logic(model_name: str, custom_questions: Optional[list] = None):
             
             # Provide helpful error hints
             output_text = '\n'.join(output_lines)
-            if "rope_scaling" in output_text:
-                print("\n💡 Hint: Model configuration issue - vLLM 0.9.1 should handle this better")
+            if "max_model_len" in output_text and "greater than" in output_text:
+                print("\n💡 Hint: Model context length issue - this should now be fixed with config reading")
             elif "out of memory" in output_text.lower():
                 print("\n💡 Hint: Try reducing max_model_len or using a larger GPU")
-                print("   Or reduce gpu_memory_utilization")
             elif "quantization" in output_text.lower():
-                print("\n💡 Hint: Check if the quantization format is supported in vLLM 0.9.1")
-            elif "cuda" in output_text.lower() and "error" in output_text.lower():
-                print("\n💡 Hint: CUDA compatibility issue - check GPU driver support")
+                print("\n💡 Hint: Check if the quantization format is supported")
+            elif "import" in output_text.lower() and "error" in output_text.lower():
+                print("\n💡 Hint: Package dependency issue")
             
             raise RuntimeError(f"vLLM failed to start (exit code: {vllm_process.returncode})")
         
@@ -298,7 +371,8 @@ def run_chat_logic(model_name: str, custom_questions: Optional[list] = None):
             line = vllm_process.stdout.readline()
             if line:
                 output_lines.append(line.strip())
-                if i % 30 == 0 and line.strip():  # Print some output periodically
+                # Show output every 30 iterations
+                if i % 30 == 0 and line.strip():
                     print(f"   {line.strip()}")
         except:
             pass
@@ -312,11 +386,10 @@ def run_chat_logic(model_name: str, custom_questions: Optional[list] = None):
             print("✅ vLLM server is ready!")
             break
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
-            if i % 60 == 0:  # Progress update every 2 minutes
-                print(f"⏳ Waiting for server... ({i+1}/{max_retries}) - Large models take time to load")
+            if i % 60 == 0:
+                print(f"⏳ Waiting for server... ({i+1}/{max_retries})")
             time.sleep(2)
     else:
-        # Timeout reached
         print("⏰ Startup timeout reached!")
         print(f"📝 Recent output:")
         for line in output_lines[-20:]:
@@ -336,9 +409,10 @@ def run_chat_logic(model_name: str, custom_questions: Optional[list] = None):
             test_response = requests.get(f"http://localhost:{port}/v1/models", timeout=10)
             print(f"✅ API test successful: {test_response.status_code}")
             
-            # Also test completions endpoint
+            # Show available model
             models_data = test_response.json()
-            print(f"📋 Available model: {models_data.get('data', [{}])[0].get('id', 'Unknown')}")
+            available_models = [m.get('id', 'Unknown') for m in models_data.get('data', [])]
+            print(f"📋 Available models: {', '.join(available_models)}")
         except Exception as e:
             print(f"⚠️  API test failed: {e}")
         
@@ -346,7 +420,6 @@ def run_chat_logic(model_name: str, custom_questions: Optional[list] = None):
         if custom_questions:
             questions = custom_questions
         else:
-            # Model-specific default questions  
             if "llama" in model_name.lower() and any(v in model_name.lower() for v in ["3.1", "3-1"]):
                 questions = [
                     "Hello! I'm testing Llama 3.1. Please introduce yourself briefly.",
@@ -362,12 +435,12 @@ def run_chat_logic(model_name: str, custom_questions: Optional[list] = None):
                     "Tell me a short joke",
                     "Thanks!"
                 ]
-            elif "code" in model_name.lower() or "coder" in model_name.lower():
+            elif "dialog" in model_name.lower() or "chat" in model_name.lower():
                 questions = [
-                    "Write a Python function to reverse a string",
-                    "How do I sort a list in Python?", 
-                    "What's the difference between == and is in Python?",
-                    "Thanks for the help!"
+                    "Hello! How are you today?",
+                    "What's your favorite hobby?",
+                    "Can you tell me a fun fact?",
+                    "Thanks for chatting!"
                 ]
             else:
                 questions = [
@@ -397,7 +470,7 @@ def run_chat_logic(model_name: str, custom_questions: Optional[list] = None):
                     json={
                         "model": model_name,
                         "messages": conversation,
-                        "max_tokens": 300,  # Increased for better responses
+                        "max_tokens": min(300, vllm_config["max_model_len"] // 4),
                         "temperature": 0.8,
                         "top_p": 0.9,
                     },
@@ -420,7 +493,6 @@ def run_chat_logic(model_name: str, custom_questions: Optional[list] = None):
         print(f"🌐 Server is still running at: {tunnel.url}")
         
         print("\n⏰ Keeping server alive for 5 minutes for additional testing...")
-        print("   You can use the URL above to make API calls")
         try:
             time.sleep(300)
         except KeyboardInterrupt:
@@ -517,24 +589,84 @@ def chat(questions: str = ""):
         custom_questions = [q.strip() for q in questions.split("|") if q.strip()]
         print(f"📝 Using {len(custom_questions)} custom questions")
     
-    # Get the appropriate chat function based on GPU requirements
     chat_func = get_chat_function(current_model)
     chat_func.remote(current_model, custom_questions)
 
 @app.local_entrypoint()
-def download(model_name: str):
-    """Download a specific model"""
-    if not model_name:
-        print("❌ Please specify a model name")
-        return
+def test_llama31():
+    """Test Llama 3.1 8B GPTQ with vLLM 0.9.1"""
+    model_name = "hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4"
+    print(f"🧪 Testing {model_name} with vLLM 0.9.1")
     
-    print(f"📥 Downloading model: {model_name}")
-    try:
-        result = download_model_remote.remote(model_name)
-        print(result)
-        print(f"💡 To use this model: MODEL_NAME='{model_name}' modal run script.py::chat")
-    except Exception as e:
-        print(f"❌ Failed to download model: {e}")
+    chat_func = get_chat_function(model_name)
+    chat_func.remote(model_name, [
+        "Hello! I'm testing Llama 3.1 with vLLM 0.9.1. Please introduce yourself.",
+        "What new features does Llama 3.1 bring?",
+        "Write a Python function to calculate factorial using recursion.",
+        "Explain machine learning in simple terms.",
+        "Thanks for the comprehensive test!"
+    ])
+
+@app.local_entrypoint()
+def curl_examples():
+    """Show curl examples for testing the API"""
+    current_model = os.environ.get("MODEL_NAME", DEFAULT_MODEL)
+    
+    print(f"🌐 Curl Examples for Testing vLLM API")
+    print(f"📖 Model: {current_model}")
+    print("=" * 60)
+    
+    print("\n1. 🏥 Health Check:")
+    print("curl -f https://your-server-url.modal.run/health")
+    
+    print("\n2. 📋 List Models:")
+    print("curl https://your-server-url.modal.run/v1/models")
+    
+    print("\n3. 💬 Chat Completion:")
+    print(f"""curl https://your-server-url.modal.run/v1/chat/completions \\
+  -H "Content-Type: application/json" \\
+  -H "Authorization: Bearer vllm" \\
+  -d '{{
+    "model": "{current_model}",
+    "messages": [
+      {{"role": "user", "content": "Hello! Can you introduce yourself?"}}
+    ],
+    "max_tokens": 200,
+    "temperature": 0.8
+  }}'""")
+    
+    print("\n4. ✍️  Text Completion:")
+    print(f"""curl https://your-server-url.modal.run/v1/completions \\
+  -H "Content-Type: application/json" \\
+  -H "Authorization: Bearer vllm" \\
+  -d '{{
+    "model": "{current_model}",
+    "prompt": "The capital of France is",
+    "max_tokens": 50,
+    "temperature": 0.7
+  }}'""")
+    
+    print("\n5. 🌊 Streaming Chat:")
+    print(f"""curl https://your-server-url.modal.run/v1/chat/completions \\
+  -H "Content-Type: application/json" \\
+  -H "Authorization: Bearer vllm" \\
+  -d '{{
+    "model": "{current_model}",
+    "messages": [
+      {{"role": "user", "content": "Write a Python function for fibonacci"}}
+    ],
+    "max_tokens": 300,
+    "stream": true
+  }}'""")
+    
+    print("\n💡 Tips:")
+    print("- Replace 'your-server-url.modal.run' with the actual URL from the chat session")
+    print("- The server stays alive for 5 minutes after the chat completes")
+    print("- Use 'Bearer vllm' as the authorization header")
+    print(f"- Model name should be: {current_model}")
+    
+    print(f"\n🚀 To start server first:")
+    print(f"MODEL_NAME='{current_model}' modal run script.py::chat")
 
 @app.local_entrypoint()
 def info():
@@ -547,37 +679,8 @@ def info():
     print(f"  Model: {current_model}")
     print(f"  GPU: {gpu_type} ({gpu_util*100}% memory)")
     print(f"  Max length: {vllm_config['max_model_len']}")
-    print(f"  Max batched tokens: {min(vllm_config['max_num_seqs'] * 512, 8192)}")
-    print(f"  Tensor parallel: {vllm_config['tensor_parallel_size']}")
     print(f"  Dtype: {vllm_config['dtype']}")
     if vllm_config['quantization']:
         print(f"  Quantization: {vllm_config['quantization']}")
     
-    print(f"\n📋 Usage Examples:")
-    print(f"  Llama 3.1 8B GPTQ: MODEL_NAME='hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4' modal run script.py::chat")
-    print(f"  TinyLlama: MODEL_NAME='TinyLlama/TinyLlama-1.1B-Chat-v1.0' modal run script.py::chat")
-
-# --- Test functions ---
-@app.local_entrypoint()
-def test_llama31():
-    """Test Llama 3.1 8B GPTQ with vLLM 0.9.1"""
-    model_name = "hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4"
-    print(f"🧪 Testing {model_name} with vLLM 0.9.1")
-    
-    chat_func = get_chat_function(model_name)
-    chat_func.remote(model_name, [
-        "Hello! I'm testing Llama 3.1 with vLLM 0.9.1. Please introduce yourself.",
-        "What new features does Llama 3.1 bring?",
-        "Write a Python function to calculate the factorial of a number using recursion.",
-        "Explain the concept of machine learning in simple terms.",
-        "Thanks for the comprehensive test!"
-    ])
-
-@app.local_entrypoint()
-def version():
-    """Show vLLM version info"""
-    print("📦 Package Versions:")
-    print("  vLLM: 0.9.1")
-    print("  Transformers: 4.46.2")
-    print("  PyTorch: 2.5.1")
-    print("  Python: 3.11")
+    print(f"\n🔧 Note: Actual max_model_len will be adjusted based on model config.json after download")
