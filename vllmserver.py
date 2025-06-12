@@ -108,8 +108,10 @@ def get_gpu_config(model_name: str):
         if any(quant in model_name_lower for quant in ["gptq", "int4", "int8", "awq", "gguf"]):
             if "70b" in model_name_lower:
                 return "A100", 0.85  # 70B quantized can fit on A100
-            elif any(size in model_name_lower for size in ["13b", "7b", "8b"]):
-                return "A10G", 0.8  # 7B-13B quantized can fit on A10G
+            elif any(size in model_name_lower for size in ["13b"]):
+                return "A10G", 0.8  # 13B quantized needs A10G
+            elif any(size in model_name_lower for size in ["7b", "8b"]):
+                return "L4", 0.75   # 7B-8B quantized can fit on L4 with conservative memory
         else:
             # Full precision models
             if "70b" in model_name_lower:
@@ -123,15 +125,19 @@ def get_gpu_config(model_name: str):
     
     # Medium models (3-6B parameters)  
     elif any(size in model_name_lower for size in ["3b", "4b", "6b"]):
-        return "A10G", 0.8
+        # 3B can fit on L4, 4B+ need A10G
+        if any(size in model_name_lower for size in ["3b"]):
+            return "L4", 0.75
+        else:
+            return "A10G", 0.8
     
     # Chat/dialog models (usually medium sized)
     elif any(term in model_name_lower for term in ["dialog", "chat", "gpt2", "dialo"]):
-        return "A10G", 0.8
+        return "L4", 0.75  # Most chat models are small-medium
     
     # Default for unknown sizes
     else:
-        return "A10G", 0.8
+        return "L4", 0.75  # Conservative default
 
 # --- Dynamic vLLM configuration based on model ---
 def get_vllm_config(model_name: str, gpu_type: str, model_config: dict = None):
@@ -201,6 +207,11 @@ def get_vllm_config(model_name: str, gpu_type: str, model_config: dict = None):
         config["max_model_len"] = min(config["max_model_len"], 2048)
         config["max_num_seqs"] = min(config["max_num_seqs"], 8)
         config["dtype"] = "half"  # Force float16 for T4 compatibility
+    elif gpu_type == "L4":
+        # L4 has 24GB VRAM, similar to A10G but newer architecture
+        config["max_model_len"] = min(config["max_model_len"], 4096)
+        config["max_num_seqs"] = min(config["max_num_seqs"], 12)
+        config["dtype"] = "auto"  # L4 supports modern dtypes
     elif gpu_type in ["A100", "H100"]:
         config["dtype"] = "auto"  # These support bfloat16
     else:  # A10G and others
@@ -306,9 +317,15 @@ def run_chat_logic(model_name: str, custom_questions: Optional[list] = None, api
         vllm_command.extend(["--quantization", vllm_config["quantization"]])
         print(f"🔧 Detected quantization: {vllm_config['quantization']}")
     
-    # vLLM 0.9.1 specific optimizations
+    # GPU-specific optimizations
     if gpu_type in ["A100", "H100"]:
         vllm_command.append("--enable-chunked-prefill")
+    elif gpu_type == "L4":
+        # L4 specific optimizations
+        vllm_command.extend([
+            "--block-size", "16",  # Smaller block size for better memory efficiency
+            "--swap-space", "4",   # Enable some CPU swap for larger models
+        ])
     
     print("🚀 Starting vLLM server...")
     print(f"⚙️ Config: max_len={vllm_config['max_model_len']}, batched_tokens={min(vllm_config['max_num_seqs'] * 256, vllm_config['max_model_len'] * 2)}, dtype={vllm_config['dtype']}")
@@ -322,6 +339,10 @@ def run_chat_logic(model_name: str, custom_questions: Optional[list] = None, api
     env["CUDA_VISIBLE_DEVICES"] = "0"
     # Allow overriding max model len if needed (though we shouldn't need this now)
     env["VLLM_ALLOW_LONG_MAX_MODEL_LEN"] = "1"
+    
+    # L4-specific environment optimizations
+    if gpu_type == "L4":
+        env["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128"
     
     vllm_process = subprocess.Popen(
         vllm_command, 
@@ -358,7 +379,9 @@ def run_chat_logic(model_name: str, custom_questions: Optional[list] = None, api
             if "max_model_len" in output_text and "greater than" in output_text:
                 print("\n💡 Hint: Model context length issue - this should now be fixed with config reading")
             elif "out of memory" in output_text.lower():
-                print("\n💡 Hint: Try reducing max_model_len or using a larger GPU")
+                print(f"\n💡 Hint: Try reducing max_model_len or using a larger GPU than {gpu_type}")
+                if gpu_type == "L4":
+                    print("💡 For L4: Consider using INT4/GPTQ quantized models for better memory efficiency")
             elif "quantization" in output_text.lower():
                 print("\n💡 Hint: Check if the quantization format is supported")
             elif "import" in output_text.lower() and "error" in output_text.lower():
@@ -557,6 +580,16 @@ def run_chat_t4(model_name: str, custom_questions: Optional[list] = None, api_on
     return run_chat_logic(model_name, custom_questions, api_only)
 
 @app.function(
+    gpu="L4",
+    image=base_image,
+    secrets=[modal.Secret.from_name("huggingface")],
+    timeout=3600,
+)
+def run_chat_l4(model_name: str, custom_questions: Optional[list] = None, api_only: bool = False):
+    """Run chat session on L4 GPU"""
+    return run_chat_logic(model_name, custom_questions, api_only)
+
+@app.function(
     gpu="A10G",
     image=base_image,
     secrets=[modal.Secret.from_name("huggingface")],
@@ -608,6 +641,8 @@ def get_chat_function(model_name: str):
     
     if gpu_type == "T4":
         return run_chat_t4
+    elif gpu_type == "L4":
+        return run_chat_l4
     elif gpu_type == "A10G":
         return run_chat_a10g
     elif gpu_type == "A100":
@@ -615,7 +650,7 @@ def get_chat_function(model_name: str):
     elif gpu_type == "H100":
         return run_chat_h100
     else:
-        return run_chat_a10g
+        return run_chat_l4  # Default to L4 as it's cost-effective
 
 # --- Local entrypoints ---
 @app.local_entrypoint()
@@ -677,6 +712,20 @@ def test_llama31():
         "Write a Python function to calculate factorial using recursion.",
         "Explain machine learning in simple terms.",
         "Thanks for the comprehensive test!"
+    ], api_only=False)
+
+@app.local_entrypoint()
+def test_l4():
+    """Test L4 with a quantized model optimized for its memory"""
+    model_name = "microsoft/DialoGPT-medium"  # Good test model for L4
+    print(f"🧪 Testing L4 GPU with {model_name}")
+    
+    chat_func = get_chat_function(model_name)
+    chat_func.remote(model_name, [
+        "Hello! I'm testing L4 GPU capabilities.",
+        "What's the weather like?",
+        "Tell me a short story about AI.",
+        "Thanks for the L4 test!"
     ], api_only=False)
 
 @app.local_entrypoint()
@@ -763,13 +812,27 @@ def info():
     if vllm_config['quantization']:
         print(f"  Quantization: {vllm_config['quantization']}")
     
+    print(f"\n🎯 GPU Capabilities:")
+    print(f"  T4:  16GB VRAM  - Small models (1-2B), basic quantized")
+    print(f"  L4:  24GB VRAM  - Medium models (3B), 7B quantized")
+    print(f"  A10G: 24GB VRAM - Medium models (3-6B), 7B quantized")
+    print(f"  A100: 40-80GB   - Large models (7-13B), 70B quantized")
+    print(f"  H100: 80GB      - Largest models (70B+)")
+    
     print(f"\n📋 Available Commands:")
-    print(f"  serve_api   - Run API server indefinitely")
-    print(f"  serve_demo  - Run API server for 5 minutes") 
-    print(f"  chat        - Run chat demo + 5 min API")
+    print(f"  serve_api    - Run API server indefinitely")
+    print(f"  serve_demo   - Run API server for 5 minutes") 
+    print(f"  chat         - Run chat demo + 5 min API")
     print(f"  test_llama31 - Test Llama 3.1 model")
-    print(f"  download    - Download model only")
+    print(f"  test_l4      - Test L4 GPU specifically")
+    print(f"  download     - Download model only")
     print(f"  curl_examples - Show API usage examples")
-    print(f"  info        - Show this configuration")
+    print(f"  info         - Show this configuration")
+    
+    print(f"\n💡 L4 Recommended Models:")
+    print(f"  - microsoft/DialoGPT-medium")
+    print(f"  - TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+    print(f"  - stabilityai/stablelm-3b-4e1t")
+    print(f"  - Qwen/Qwen2-3B-Instruct")
     
     print(f"\n🔧 Note: Actual max_model_len will be adjusted based on model config.json after download")

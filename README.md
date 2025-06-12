@@ -145,14 +145,14 @@ The system automatically detects and optimizes for:
 - 💻 **Code Models**: CodeLlama, StarCoder variants
 
 ### 🎯 GPU Selection Logic
-
 | Model Size | Quantized | GPU Selected | Memory Utilization |
 |------------|-----------|--------------|-------------------|
 | 70B | ❌ | H100 🚀 | 90% |
 | 70B | ✅ | A100 ⚡ | 85% |
 | 7B-13B | ❌ | A100 ⚡ | 85% |
-| 7B-13B | ✅ | A10G 💪 | 80% |
-| 3B-6B | Any | A10G 💪 | 80% |
+| 7B-13B | ✅ | L4 ⚡ | 85% |
+| 3B-6B | ❌ | A10G 💪 | 80% |
+| 3B-6B | ✅ | L4 ⚡ | 80% |
 | 1B-2B | Any | T4 🔧 | 80% |
 
 ## ⚙️ Configuration
