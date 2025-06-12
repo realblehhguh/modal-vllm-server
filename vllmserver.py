@@ -246,7 +246,7 @@ base_image = (
 )
 
 # --- Core chat function ---
-def run_chat_logic(model_name: str, custom_questions: Optional[list] = None):
+def run_chat_logic(model_name: str, custom_questions: Optional[list] = None, api_only: bool = False):
     """Core chat logic that runs the vLLM server and handles chat"""
     # Get model configuration
     gpu_type, gpu_memory_util = get_gpu_config(model_name)
@@ -416,10 +416,51 @@ def run_chat_logic(model_name: str, custom_questions: Optional[list] = None):
         except Exception as e:
             print(f"⚠️  API test failed: {e}")
         
-        # Use custom questions or defaults
-        if custom_questions:
-            questions = custom_questions
+        # Handle different modes
+        if api_only:
+            # API-only mode - no chat demo, run indefinitely
+            print("\n🌐 API Server ready! Running in API-only mode.")
+            print(f"📖 Use the following URL for API calls: {tunnel.url}")
+            print("🔌 Available endpoints:")
+            print(f"  - Health: {tunnel.url}/health")
+            print(f"  - Models: {tunnel.url}/v1/models") 
+            print(f"  - Chat: {tunnel.url}/v1/chat/completions")
+            print(f"  - Completions: {tunnel.url}/v1/completions")
+            print("\n⏰ Server running indefinitely. Modal will auto-scale down after inactivity.")
+            print("💡 Press Ctrl+C to stop the server manually.")
+            
+            try:
+                # Keep server alive indefinitely
+                while True:
+                    time.sleep(300)  # 5 minute heartbeat
+                    print("💓 Server heartbeat - still running...")
+            except KeyboardInterrupt:
+                print("\n🛑 Stopping server...")
+                return
+            finally:
+                vllm_process.terminate()
+        
+        elif custom_questions is None or len(custom_questions) == 0:
+            # Empty questions = short API demo mode
+            print("\n🧪 API demo mode - server will stay alive for 5 minutes for testing")
+            print(f"📖 Use the following URL for API calls: {tunnel.url}")
+            print("🔌 Available endpoints:")
+            print(f"  - Health: {tunnel.url}/health")
+            print(f"  - Models: {tunnel.url}/v1/models") 
+            print(f"  - Chat: {tunnel.url}/v1/chat/completions")
+            print(f"  - Completions: {tunnel.url}/v1/completions")
+            
+            print("\n⏰ Keeping server alive for 5 minutes for testing...")
+            try:
+                time.sleep(300)
+            except KeyboardInterrupt:
+                print("\n🛑 Stopping server...")
+            finally:
+                vllm_process.terminate()
+            return
+        
         else:
+            # Chat demo mode
             if "llama" in model_name.lower() and any(v in model_name.lower() for v in ["3.1", "3-1"]):
                 questions = [
                     "Hello! I'm testing Llama 3.1. Please introduce yourself briefly.",
@@ -448,57 +489,61 @@ def run_chat_logic(model_name: str, custom_questions: Optional[list] = None):
                     "What can you help me with today?",
                     "Thank you for the demo!"
                 ]
-        
-        conversation = []
-        
-        print(f"\n{'='*60}")
-        print(f"🤖 Chat Session with {model_name}")
-        print(f"{'='*60}\n")
-        
-        for question in questions:
-            print(f"👤 You: {question}")
             
-            conversation.append({"role": "user", "content": question})
+            # Use custom questions if provided
+            if custom_questions:
+                questions = custom_questions
+        
+            conversation = []
             
-            try:
-                response = requests.post(
-                    f"http://localhost:{port}/v1/chat/completions",
-                    headers={
-                        "Content-Type": "application/json", 
-                        "Authorization": "Bearer vllm"
-                    },
-                    json={
-                        "model": model_name,
-                        "messages": conversation,
-                        "max_tokens": min(300, vllm_config["max_model_len"] // 4),
-                        "temperature": 0.8,
-                        "top_p": 0.9,
-                    },
-                    timeout=90
-                )
+            print(f"\n{'='*60}")
+            print(f"🤖 Chat Session with {model_name}")
+            print(f"{'='*60}\n")
+            
+            for question in questions:
+                print(f"👤 You: {question}")
                 
-                if response.status_code == 200:
-                    ai_response = response.json()["choices"][0]["message"]["content"]
-                    conversation.append({"role": "assistant", "content": ai_response})
-                    print(f"🤖 AI: {ai_response}\n")
-                else:
-                    print(f"❌ Error: {response.status_code} - {response.text}\n")
+                conversation.append({"role": "user", "content": question})
+                
+                try:
+                    response = requests.post(
+                        f"http://localhost:{port}/v1/chat/completions",
+                        headers={
+                            "Content-Type": "application/json", 
+                            "Authorization": "Bearer vllm"
+                        },
+                        json={
+                            "model": model_name,
+                            "messages": conversation,
+                            "max_tokens": min(300, vllm_config["max_model_len"] // 4),
+                            "temperature": 0.8,
+                            "top_p": 0.9,
+                        },
+                        timeout=90
+                    )
                     
-            except Exception as e:
-                print(f"❌ Error: {e}\n")
+                    if response.status_code == 200:
+                        ai_response = response.json()["choices"][0]["message"]["content"]
+                        conversation.append({"role": "assistant", "content": ai_response})
+                        print(f"🤖 AI: {ai_response}\n")
+                    else:
+                        print(f"❌ Error: {response.status_code} - {response.text}\n")
+                        
+                except Exception as e:
+                    print(f"❌ Error: {e}\n")
+                
+                time.sleep(1)
             
-            time.sleep(1)
-        
-        print("✅ Chat session completed!")
-        print(f"🌐 Server is still running at: {tunnel.url}")
-        
-        print("\n⏰ Keeping server alive for 5 minutes for additional testing...")
-        try:
-            time.sleep(300)
-        except KeyboardInterrupt:
-            print("\n🛑 Stopping server...")
-        finally:
-            vllm_process.terminate()
+            print("✅ Chat session completed!")
+            print(f"🌐 Server is still running at: {tunnel.url}")
+            
+            print("\n⏰ Keeping server alive for 5 minutes for additional testing...")
+            try:
+                time.sleep(300)
+            except KeyboardInterrupt:
+                print("\n🛑 Stopping server...")
+            finally:
+                vllm_process.terminate()
 
 # --- GPU-specific chat functions ---
 @app.function(
@@ -507,9 +552,9 @@ def run_chat_logic(model_name: str, custom_questions: Optional[list] = None):
     secrets=[modal.Secret.from_name("huggingface")],
     timeout=3600,
 )
-def run_chat_t4(model_name: str, custom_questions: Optional[list] = None):
+def run_chat_t4(model_name: str, custom_questions: Optional[list] = None, api_only: bool = False):
     """Run chat session on T4 GPU"""
-    return run_chat_logic(model_name, custom_questions)
+    return run_chat_logic(model_name, custom_questions, api_only)
 
 @app.function(
     gpu="A10G",
@@ -517,9 +562,9 @@ def run_chat_t4(model_name: str, custom_questions: Optional[list] = None):
     secrets=[modal.Secret.from_name("huggingface")],
     timeout=3600,
 )
-def run_chat_a10g(model_name: str, custom_questions: Optional[list] = None):
+def run_chat_a10g(model_name: str, custom_questions: Optional[list] = None, api_only: bool = False):
     """Run chat session on A10G GPU"""
-    return run_chat_logic(model_name, custom_questions)
+    return run_chat_logic(model_name, custom_questions, api_only)
 
 @app.function(
     gpu="A100",
@@ -527,9 +572,9 @@ def run_chat_a10g(model_name: str, custom_questions: Optional[list] = None):
     secrets=[modal.Secret.from_name("huggingface")],
     timeout=3600,
 )
-def run_chat_a100(model_name: str, custom_questions: Optional[list] = None):
+def run_chat_a100(model_name: str, custom_questions: Optional[list] = None, api_only: bool = False):
     """Run chat session on A100 GPU"""
-    return run_chat_logic(model_name, custom_questions)
+    return run_chat_logic(model_name, custom_questions, api_only)
 
 @app.function(
     gpu="H100",
@@ -537,9 +582,9 @@ def run_chat_a100(model_name: str, custom_questions: Optional[list] = None):
     secrets=[modal.Secret.from_name("huggingface")],
     timeout=3600,
 )
-def run_chat_h100(model_name: str, custom_questions: Optional[list] = None):
+def run_chat_h100(model_name: str, custom_questions: Optional[list] = None, api_only: bool = False):
     """Run chat session on H100 GPU"""
-    return run_chat_logic(model_name, custom_questions)
+    return run_chat_logic(model_name, custom_questions, api_only)
 
 # --- Model management functions ---
 @app.function(
@@ -590,7 +635,34 @@ def chat(questions: str = ""):
         print(f"📝 Using {len(custom_questions)} custom questions")
     
     chat_func = get_chat_function(current_model)
-    chat_func.remote(current_model, custom_questions)
+    chat_func.remote(current_model, custom_questions, api_only=False)
+
+@app.local_entrypoint()
+def serve_api():
+    """Start API server without chat demo - keeps running until stopped"""
+    current_model = os.environ.get("MODEL_NAME", DEFAULT_MODEL)
+    gpu_type, _ = get_gpu_config(current_model)
+    
+    print(f"🌐 Starting API-only server...")
+    print(f"🤖 Model: {current_model}")
+    print(f"🔧 GPU: {gpu_type}")
+    print(f"⏰ Server will run indefinitely until manually stopped")
+    
+    chat_func = get_chat_function(current_model)
+    chat_func.remote(current_model, custom_questions=None, api_only=True)
+
+@app.local_entrypoint()
+def serve_demo():
+    """Start API server for 5 minutes - good for testing"""
+    current_model = os.environ.get("MODEL_NAME", DEFAULT_MODEL)
+    gpu_type, _ = get_gpu_config(current_model)
+    
+    print(f"🧪 Starting API demo server (5 minutes)...")
+    print(f"🤖 Model: {current_model}")
+    print(f"🔧 GPU: {gpu_type}")
+    
+    chat_func = get_chat_function(current_model)
+    chat_func.remote(current_model, custom_questions=[], api_only=False)
 
 @app.local_entrypoint()
 def test_llama31():
@@ -605,7 +677,14 @@ def test_llama31():
         "Write a Python function to calculate factorial using recursion.",
         "Explain machine learning in simple terms.",
         "Thanks for the comprehensive test!"
-    ])
+    ], api_only=False)
+
+@app.local_entrypoint()
+def download(model_name: str = DEFAULT_MODEL):
+    """Download a model without starting server"""
+    print(f"📥 Downloading model: {model_name}")
+    result = download_model_remote.remote(model_name)
+    print(result)
 
 @app.local_entrypoint()
 def curl_examples():
@@ -660,13 +739,14 @@ def curl_examples():
   }}'""")
     
     print("\n💡 Tips:")
-    print("- Replace 'your-server-url.modal.run' with the actual URL from the chat session")
-    print("- The server stays alive for 5 minutes after the chat completes")
+    print("- Replace 'your-server-url.modal.run' with the actual URL from the server output")
     print("- Use 'Bearer vllm' as the authorization header")
     print(f"- Model name should be: {current_model}")
     
-    print(f"\n🚀 To start server first:")
-    print(f"MODEL_NAME='{current_model}' modal run script.py::chat")
+    print(f"\n🚀 Server Commands:")
+    print(f"  API-only (indefinite):  MODEL_NAME='{current_model}' modal run script.py::serve_api")
+    print(f"  API demo (5 min):       MODEL_NAME='{current_model}' modal run script.py::serve_demo")
+    print(f"  Chat demo:              MODEL_NAME='{current_model}' modal run script.py::chat")
 
 @app.local_entrypoint()
 def info():
@@ -682,5 +762,14 @@ def info():
     print(f"  Dtype: {vllm_config['dtype']}")
     if vllm_config['quantization']:
         print(f"  Quantization: {vllm_config['quantization']}")
+    
+    print(f"\n📋 Available Commands:")
+    print(f"  serve_api   - Run API server indefinitely")
+    print(f"  serve_demo  - Run API server for 5 minutes") 
+    print(f"  chat        - Run chat demo + 5 min API")
+    print(f"  test_llama31 - Test Llama 3.1 model")
+    print(f"  download    - Download model only")
+    print(f"  curl_examples - Show API usage examples")
+    print(f"  info        - Show this configuration")
     
     print(f"\n🔧 Note: Actual max_model_len will be adjusted based on model config.json after download")

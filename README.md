@@ -71,6 +71,70 @@ modal run vllmserver.py::download --model-name "hugging-quants/Meta-Llama-3.1-8B
 modal run vllmserver.py::test_llama31
 ```
 
+### 🚀 Run API-Only mode
+```bash
+modal run vllmserver.py::serve_api
+
+# Other HF Model
+MODEL_NAME='hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4' modal run vllmserver.py::serve_api
+
+# Heartbeat Check
+curl https://your-url.modal.run/health
+
+# List Models
+curl https://your-url.modal.run/v1/models
+
+# Chat Completion
+curl https://your-url.modal.run/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer vllm" \
+  -d '{
+    "model": "hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4",
+    "messages": [
+      {"role": "user", "content": "Hello! How are you?"}
+    ],
+    "max_tokens": 200,
+    "temperature": 0.7
+  }'
+  
+# Streaming Chat
+curl https://your-url.modal.run/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer vllm" \
+  -d '{
+    "model": "hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4", 
+    "messages": [
+      {"role": "user", "content": "Write a Python function"}
+    ],
+    "max_tokens": 300,
+    "stream": true
+  }'
+# Text Completion
+curl https://your-url.modal.run/v1/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer vllm" \
+  -d '{
+    "model": "hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4",
+    "prompt": "The capital of France is",
+    "max_tokens": 50
+  }'
+# Python Client
+import openai
+
+client = openai.OpenAI(
+    base_url="https://your-url.modal.run/v1",
+    api_key="vllm"  # Can be anything
+)
+
+response = client.chat.completions.create(
+    model="hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4",
+    messages=[{"role": "user", "content": "Hello!"}],
+    max_tokens=100
+)
+
+print(response.choices[0].message.content)
+```
+
 ## 🤖 Supported Models
 
 The system automatically detects and optimizes for:
