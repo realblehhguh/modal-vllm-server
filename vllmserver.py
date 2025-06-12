@@ -14,13 +14,17 @@ DEFAULT_MODEL = "microsoft/DialoGPT-medium"
 # --- Modal App Setup ---
 app = modal.App("vllm-openai-server")
 
+# --- Create a default volume for the app ---
+default_volume = modal.Volume.from_name("vllm-models-storage", create_if_missing=True)
+
 # --- Helper functions ---
-def get_model_info(model_name: str):
-    """Get model-specific paths and volume name"""
-    volume_name = f"vllm-model-vol-{model_name.replace('/', '--').replace('_', '-')}"
-    model_base_path = Path("/model")
-    model_path = model_base_path / model_name.split("/")[-1]
-    return volume_name, model_base_path, model_path
+def get_model_path_from_name(model_name: str):
+    """Get a safe path for the model inside the volume"""
+    # Create a safe directory name from model name
+    safe_name = model_name.replace("/", "--").replace("_", "-").replace(".", "-").lower()
+    model_base_path = Path("/models")
+    model_path = model_base_path / safe_name
+    return model_path
 
 def get_model_config(model_path: Path):
     """Read model config to get actual limits"""
@@ -76,18 +80,20 @@ def is_model_supported(model_config: dict, model_name: str) -> bool:
     return True
 
 def download_model_to_path(model_name: str, model_path: Path):
-    """Download model to specific path"""
+    """Download model to specific path with integrity checking"""
     import os
     import shutil
     from huggingface_hub import snapshot_download
     
     os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
 
+    # Check if model already exists and is complete
     if model_path.exists():
-        print(f"Model directory exists at {model_path}, checking integrity...")
+        print(f"📁 Model directory exists at {model_path}, checking integrity...")
         
         # Check for essential files
         essential_files = ["config.json"]
+        optional_files = ["pytorch_model.bin", "model.safetensors"]
         
         missing_essential = []
         for file in essential_files:
@@ -95,23 +101,33 @@ def download_model_to_path(model_name: str, model_path: Path):
             if not file_path.exists() or file_path.stat().st_size == 0:
                 missing_essential.append(file)
         
-        if missing_essential:
-            print(f"Found missing essential files: {missing_essential}")
-            print("Removing corrupted model directory...")
+        # Check if we have at least one model file
+        has_model_file = any((model_path / file).exists() for file in optional_files)
+        
+        if missing_essential or not has_model_file:
+            print(f"❌ Found missing essential files: {missing_essential}")
+            print(f"❌ Missing model files, re-downloading...")
+            print("🗑️  Removing corrupted model directory...")
             shutil.rmtree(model_path)
         else:
-            print("Model integrity check passed.")
+            print("✅ Model integrity check passed - using cached model")
+            return
 
     if not model_path.exists():
-        model_path.mkdir(parents=True, exist_ok=True)
         print(f"📥 Downloading {model_name} to {model_path}...")
+        model_path.mkdir(parents=True, exist_ok=True)
+        
         try:
+            # Download to path
             snapshot_download(
                 repo_id=model_name,
                 local_dir=model_path,
                 token=os.environ.get("HF_TOKEN"),
+                resume_download=True,  # Resume interrupted downloads
             )
-            print("✅ Download complete.")
+            
+            print("✅ Download complete!")
+            print("💾 Model saved to persistent volume!")
             
         except Exception as e:
             print(f"❌ Download failed: {e}")
@@ -128,11 +144,11 @@ def get_gpu_config(model_name: str):
     
     # Massive models (70B+ parameters)
     if any(size in model_name_lower for size in ["70b", "72b", "405b"]):
-        if any(quant in model_name_lower for quant in ["gptq", "int4", "int8", "awq"]):
+        if any(quant in model_name_lower for quant in ["gptq", "int4", "int8", "awq", "bnb"]):
             if "405b" in model_name_lower:
                 return "B200", 0.90  # 405B quantized needs B200
             elif any(size in model_name_lower for size in ["70b", "72b"]):
-                return "H100", 0.85  # 70B quantized can fit on H100
+                return "H200", 0.85  # 70B quantized can fit on H200
         else:
             # Full precision massive models
             if "405b" in model_name_lower:
@@ -140,38 +156,46 @@ def get_gpu_config(model_name: str):
             elif any(size in model_name_lower for size in ["70b", "72b"]):
                 return "A100-80GB", 0.90  # 70B full precision needs A100-80GB
     
-    # Large models (7B-34B parameters)
-    elif any(size in model_name_lower for size in ["7b", "8b", "13b", "14b", "34b"]):
+    # Large models (13B-34B parameters)
+    elif any(size in model_name_lower for size in ["13b", "14b", "17b", "27b", "34b"]):
         if any(quant in model_name_lower for quant in ["gptq", "int4", "int8", "awq"]):
-            if any(size in model_name_lower for size in ["34b"]):
-                return "A100-40GB", 0.85  # 34B quantized needs A100-40GB
+            if any(size in model_name_lower for size in ["27b", "34b"]):
+                return "A100-80GB", 0.85  # 27B+ quantized needs A100-80GB
+            elif any(size in model_name_lower for size in ["17b"]):
+                return "H100", 0.80  # 17B quantized fits on H100
             elif any(size in model_name_lower for size in ["13b", "14b"]):
-                return "A10G", 0.80  # 13B quantized fits on A10G
-            elif any(size in model_name_lower for size in ["7b", "8b"]):
-                return "L4", 0.75   # 7B-8B quantized can fit on L4
+                return "A100-40GB", 0.80  # 13B quantized fits on A100-40GB
         else:
             # Full precision large models
-            if any(size in model_name_lower for size in ["34b"]):
-                return "A100-80GB", 0.85  # 34B full precision needs A100-80GB
+            if any(size in model_name_lower for size in ["27b", "34b"]):
+                return "A100-80GB", 0.85  # 27B+ full precision needs A100-80GB
+            elif any(size in model_name_lower for size in ["17b"]):
+                return "H100", 0.85  # 17B full precision needs H100
             elif any(size in model_name_lower for size in ["13b", "14b"]):
                 return "A100-40GB", 0.80  # 13B full precision needs A100-40GB
-            elif any(size in model_name_lower for size in ["7b", "8b"]):
-                return "L40S", 0.80  # 7B-8B full precision works well on L40S
     
-    # Small models (1-2B parameters)
-    elif any(size in model_name_lower for size in ["1b", "2b", "mini", "small", "tinyllama"]):
-        return "T4", 0.8
+    # Medium-large models (7B-12B parameters)
+    elif any(size in model_name_lower for size in ["7b", "8b", "9b", "12b"]):
+        if any(quant in model_name_lower for quant in ["gptq", "int4", "int8", "awq"]):
+            return "L40S", 0.75   # 7B-12B quantized fits on L40S
+        else:
+            # Full precision medium-large models
+            return "L40S", 0.80  # 7B-12B full precision works well on L40S
     
     # Medium models (3-6B parameters)  
     elif any(size in model_name_lower for size in ["3b", "4b", "6b"]):
         if "stablelm" in model_name_lower or "stablecode" in model_name_lower:
             return "A10G", 0.8  # StableLM models need more resources
         elif any(size in model_name_lower for size in ["6b"]):
-            return "L40S", 0.75  # 6B models work well on L40S
+            return "A10G", 0.75  # 6B models work well on A10G
         elif any(size in model_name_lower for size in ["3b", "4b"]):
             return "L4", 0.75
         else:
             return "A10G", 0.8
+    
+    # Small models (1-2B parameters)
+    elif any(size in model_name_lower for size in ["1b", "2b", "mini", "small", "tinyllama"]):
+        return "T4", 0.8
     
     # Chat/dialog models (usually medium sized)
     elif any(term in model_name_lower for term in ["dialog", "chat", "gpt2", "dialo"]):
@@ -212,7 +236,7 @@ def get_vllm_config(model_name: str, gpu_type: str, model_config: dict = None):
         config["quantization"] = "gptq"
     elif "awq" in model_lower:
         config["quantization"] = "awq"
-    elif "int4" in model_lower:
+    elif "int4" in model_lower or "bnb" in model_lower:
         config["quantization"] = "gptq"
     elif "int8" in model_lower:
         config["quantization"] = "gptq"
@@ -228,11 +252,15 @@ def get_vllm_config(model_name: str, gpu_type: str, model_config: dict = None):
         config["max_model_len"] = min(config["max_model_len"], 8192 if config["quantization"] else 4096)
         config["max_num_seqs"] = 12 if config["quantization"] else 6
         config["tensor_parallel_size"] = 4 if gpu_type in ["H100", "H200", "A100-80GB", "B200"] else 2
-    elif any(size in model_lower for size in ["34b"]):
+    elif any(size in model_lower for size in ["27b", "34b"]):
         config["max_model_len"] = min(config["max_model_len"], 8192 if config["quantization"] else 4096)
         config["max_num_seqs"] = 10 if config["quantization"] else 6
         config["tensor_parallel_size"] = 2 if gpu_type in ["A100-40GB", "A100-80GB", "H100", "H200", "L40S"] else 1
-    elif any(size in model_lower for size in ["7b", "8b", "13b", "14b"]):
+    elif any(size in model_lower for size in ["17b"]):
+        config["max_model_len"] = min(config["max_model_len"], 8192 if config["quantization"] else 4096)
+        config["max_num_seqs"] = 8 if config["quantization"] else 6
+        config["tensor_parallel_size"] = 2 if gpu_type in ["H100", "H200", "A100-80GB"] else 1
+    elif any(size in model_lower for size in ["7b", "8b", "9b", "12b", "13b", "14b"]):
         if not model_config:
             config["max_model_len"] = min(config["max_model_len"], 8192 if config["quantization"] else 4096)
         config["max_num_seqs"] = 16 if config["quantization"] else 8
@@ -282,9 +310,13 @@ def get_vllm_config(model_name: str, gpu_type: str, model_config: dict = None):
         config["max_model_len"] = min(config["max_model_len"], 16384)
         config["max_num_seqs"] = min(config["max_num_seqs"], 32)
         config["dtype"] = "auto"
-    elif gpu_type in ["H100", "H200"]:
+    elif gpu_type == "H100":
         config["max_model_len"] = min(config["max_model_len"], 16384)
         config["max_num_seqs"] = min(config["max_num_seqs"], 48)
+        config["dtype"] = "auto"
+    elif gpu_type == "H200":
+        config["max_model_len"] = min(config["max_model_len"], 20480)
+        config["max_num_seqs"] = min(config["max_num_seqs"], 56)
         config["dtype"] = "auto"
     elif gpu_type == "B200":
         config["max_model_len"] = min(config["max_model_len"], 32768)
@@ -296,7 +328,7 @@ def get_vllm_config(model_name: str, gpu_type: str, model_config: dict = None):
     
     return config
 
-# --- Container image with clean dependency resolution ---
+# --- Container image ---
 base_image = (
     modal.Image.debian_slim(python_version="3.11")
     .apt_install("curl", "git")
@@ -328,18 +360,21 @@ base_image = (
 def run_chat_logic(model_name: str, custom_questions: Optional[list] = None, api_only: bool = False):
     """Core chat logic that runs the vLLM server and handles chat"""
     gpu_type, gpu_memory_util = get_gpu_config(model_name)
-    volume_name, model_base_path, model_path = get_model_info(model_name)
+    model_path = get_model_path_from_name(model_name)
     
     port = 8000
     
     print(f"🤖 Using model: {model_name}")
     print(f"🔧 GPU: {gpu_type}, Memory utilization: {gpu_memory_util}")
     print(f"📁 Model path: {model_path}")
+    print(f"📦 Using persistent volume for model storage")
     
     # Download model if it doesn't exist
     if not model_path.exists():
-        print(f"📥 Model not found at {model_path}, downloading...")
+        print(f"📥 Model not found in volume, downloading...")
         download_model_to_path(model_name, model_path)
+    else:
+        print(f"✅ Model found in volume: {model_path}")
     
     if not model_path.exists():
         raise RuntimeError(f"Model path {model_path} does not exist after download")
@@ -352,21 +387,26 @@ def run_chat_logic(model_name: str, custom_questions: Optional[list] = None, api
         print("⚠️ This model may have compatibility issues with vLLM 0.9.1")
         print("💡 Consider using one of these well-supported alternatives:")
         print("   - TinyLlama/TinyLlama-1.1B-Chat-v1.0")
-        print("   - microsoft/DialoGPT-medium")
-        print("   - hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4")
         print("   - Qwen/Qwen2.5-3B-Instruct")
+        print("   - 01-ai/Yi-1.5-6B-Chat")
+        print("   - unsloth/mistral-7b-v0.2")
         print("\n🎯 Attempting to start anyway with conservative settings...")
     
     # Show model files
     files = list(model_path.glob("*"))
     print(f"📁 Model directory contains {len(files)} files")
     essential_files = ["config.json", "pytorch_model.bin", "model.safetensors", "quantize_config.json"]
+    total_size = 0
     for efile in essential_files:
         epath = model_path / efile
         if epath.exists():
-            print(f"   ✅ {efile} ({epath.stat().st_size / 1e6:.1f} MB)")
+            size_mb = epath.stat().st_size / 1e6
+            total_size += size_mb
+            print(f"   ✅ {efile} ({size_mb:.1f} MB)")
         else:
             print(f"   ❌ {efile} (missing)")
+    
+    print(f"💾 Total model size: {total_size:.1f} MB")
     
     # Get configuration
     vllm_config = get_vllm_config(model_name, gpu_type, model_config)
@@ -465,8 +505,8 @@ def run_chat_logic(model_name: str, custom_questions: Optional[list] = None, api
                 print(f"\n💡 Hint: Model '{model_name}' may not be fully compatible with vLLM 0.9.1")
                 print("   Try these well-supported alternatives:")
                 print("   - TinyLlama/TinyLlama-1.1B-Chat-v1.0")
-                print("   - microsoft/DialoGPT-medium")
-                print("   - hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4")
+                print("   - Qwen/Qwen2.5-3B-Instruct")
+                print("   - 01-ai/Yi-1.5-6B-Chat")
             
             raise RuntimeError(f"vLLM failed to start (exit code: {vllm_process.returncode})")
         
@@ -540,8 +580,8 @@ def run_chat_logic(model_name: str, custom_questions: Optional[list] = None, api
             print("🔌 Available endpoints:")
             print(f"  - Health: {tunnel.url}/health")
             print(f"  - Models: {tunnel.url}/v1/models")
-            print(f"  - Chat: {tunnel.url}/v1/chat/completions")
             print(f"  - Completions: {tunnel.url}/v1/completions")
+            print(f"  - Chat: {tunnel.url}/v1/chat/completions")
             
             print("\n⏰ Keeping server alive for 5 minutes for testing...")
             try:
@@ -606,40 +646,94 @@ def run_chat_logic(model_name: str, custom_questions: Optional[list] = None, api
             finally:
                 vllm_process.terminate()
 
-# --- GPU-specific functions ---
-@app.function(gpu="T4", image=base_image, secrets=[modal.Secret.from_name("huggingface")], timeout=3600)
+# --- GPU-specific functions with volumes ---
+@app.function(
+    gpu="T4", 
+    image=base_image, 
+    secrets=[modal.Secret.from_name("huggingface")], 
+    timeout=3600,
+    volumes={"/models": default_volume}
+)
 def run_chat_t4(model_name: str, custom_questions: Optional[list] = None, api_only: bool = False):
     return run_chat_logic(model_name, custom_questions, api_only)
 
-@app.function(gpu="L4", image=base_image, secrets=[modal.Secret.from_name("huggingface")], timeout=3600)
+@app.function(
+    gpu="L4", 
+    image=base_image, 
+    secrets=[modal.Secret.from_name("huggingface")], 
+    timeout=3600,
+    volumes={"/models": default_volume}
+)
 def run_chat_l4(model_name: str, custom_questions: Optional[list] = None, api_only: bool = False):
     return run_chat_logic(model_name, custom_questions, api_only)
 
-@app.function(gpu="A10G", image=base_image, secrets=[modal.Secret.from_name("huggingface")], timeout=3600)
+@app.function(
+    gpu="A10G", 
+    image=base_image, 
+    secrets=[modal.Secret.from_name("huggingface")], 
+    timeout=3600,
+    volumes={"/models": default_volume}
+)
 def run_chat_a10g(model_name: str, custom_questions: Optional[list] = None, api_only: bool = False):
     return run_chat_logic(model_name, custom_questions, api_only)
 
-@app.function(gpu="L40S", image=base_image, secrets=[modal.Secret.from_name("huggingface")], timeout=3600)
+@app.function(
+    gpu="L40S", 
+    image=base_image, 
+    secrets=[modal.Secret.from_name("huggingface")], 
+    timeout=3600,
+    volumes={"/models": default_volume}
+)
 def run_chat_l40s(model_name: str, custom_questions: Optional[list] = None, api_only: bool = False):
     return run_chat_logic(model_name, custom_questions, api_only)
 
-@app.function(gpu="A100", image=base_image, secrets=[modal.Secret.from_name("huggingface")], timeout=3600)
+@app.function(
+    gpu="A100", 
+    image=base_image, 
+    secrets=[modal.Secret.from_name("huggingface")], 
+    timeout=3600,
+    volumes={"/models": default_volume}
+)
 def run_chat_a100_40gb(model_name: str, custom_questions: Optional[list] = None, api_only: bool = False):
     return run_chat_logic(model_name, custom_questions, api_only)
 
-@app.function(gpu="A100:8", image=base_image, secrets=[modal.Secret.from_name("huggingface")], timeout=3600)  
+@app.function(
+    gpu="A100:8", 
+    image=base_image, 
+    secrets=[modal.Secret.from_name("huggingface")], 
+    timeout=3600,
+    volumes={"/models": default_volume}
+)  
 def run_chat_a100_80gb(model_name: str, custom_questions: Optional[list] = None, api_only: bool = False):
     return run_chat_logic(model_name, custom_questions, api_only)
 
-@app.function(gpu="H100", image=base_image, secrets=[modal.Secret.from_name("huggingface")], timeout=3600)
+@app.function(
+    gpu="H100", 
+    image=base_image, 
+    secrets=[modal.Secret.from_name("huggingface")], 
+    timeout=3600,
+    volumes={"/models": default_volume}
+)
 def run_chat_h100(model_name: str, custom_questions: Optional[list] = None, api_only: bool = False):
     return run_chat_logic(model_name, custom_questions, api_only)
 
-@app.function(gpu="H200", image=base_image, secrets=[modal.Secret.from_name("huggingface")], timeout=3600)
+@app.function(
+    gpu="H200", 
+    image=base_image, 
+    secrets=[modal.Secret.from_name("huggingface")], 
+    timeout=3600,
+    volumes={"/models": default_volume}
+)
 def run_chat_h200(model_name: str, custom_questions: Optional[list] = None, api_only: bool = False):
     return run_chat_logic(model_name, custom_questions, api_only)
 
-@app.function(gpu="B200", image=base_image, secrets=[modal.Secret.from_name("huggingface")], timeout=3600)
+@app.function(
+    gpu="B200", 
+    image=base_image, 
+    secrets=[modal.Secret.from_name("huggingface")], 
+    timeout=3600,
+    volumes={"/models": default_volume}
+)
 def run_chat_b200(model_name: str, custom_questions: Optional[list] = None, api_only: bool = False):
     return run_chat_logic(model_name, custom_questions, api_only)
 
@@ -662,13 +756,66 @@ def get_chat_function(model_name: str):
     
     return function_map.get(gpu_type, run_chat_l4)
 
-# --- Model management ---
-@app.function(image=base_image, secrets=[modal.Secret.from_name("huggingface")], timeout=3600)
+# --- Model management with volumes ---
+@app.function(
+    image=base_image, 
+    secrets=[modal.Secret.from_name("huggingface")], 
+    timeout=3600,
+    volumes={"/models": default_volume}
+)
 def download_model_remote(model_name: str):
-    print(f"📥 Downloading model: {model_name}")
-    volume_name, model_base_path, model_path = get_model_info(model_name)
+    """Download a model to persistent volume"""
+    print(f"📥 Downloading model to volume: {model_name}")
+    model_path = get_model_path_from_name(model_name)
     download_model_to_path(model_name, model_path)
-    return f"✅ Model {model_name} downloaded successfully"
+    return f"✅ Model {model_name} downloaded and saved to volume!"
+
+@app.function(
+    image=base_image,
+    volumes={"/models": default_volume}
+)
+def list_model_files(model_name: str):
+    """List files in a model's volume"""
+    model_path = get_model_path_from_name(model_name)
+    
+    if not model_path.exists():
+        return f"❌ Model {model_name} not found in volume"
+    
+    files = list(model_path.glob("*"))
+    total_size = sum(f.stat().st_size for f in files if f.is_file())
+    
+    result = [f"📁 Model: {model_name}"]
+    result.append(f"📦 Using persistent volume storage")
+    result.append(f"📁 Path: {model_path}")
+    result.append(f"📊 Total size: {total_size / 1e9:.2f} GB")
+    result.append(f"📄 Files ({len(files)}):")
+    
+    for file in sorted(files):
+        if file.is_file():
+            size_mb = file.stat().st_size / 1e6
+            result.append(f"   ✅ {file.name} ({size_mb:.1f} MB)")
+        else:
+            result.append(f"   📁 {file.name}/")
+    
+    return "\n".join(result)
+
+@app.function(
+    image=base_image,
+    volumes={"/models": default_volume}
+)
+def delete_model_from_volume(model_name: str):
+    """Delete a model from its volume"""
+    import shutil
+    
+    model_path = get_model_path_from_name(model_name)
+    
+    if not model_path.exists():
+        return f"❌ Model {model_name} not found in volume"
+    
+    print(f"🗑️ Deleting model {model_name} from volume...")
+    shutil.rmtree(model_path)
+    
+    return f"✅ Model {model_name} deleted from volume"
 
 # --- Local entrypoints ---
 @app.local_entrypoint()
@@ -679,6 +826,7 @@ def chat(questions: str = ""):
     print(f"🚀 Starting chat session...")
     print(f"🤖 Model: {current_model}")
     print(f"🔧 GPU: {gpu_type}")
+    print(f"📦 Using persistent volume for model storage")
     
     custom_questions = None
     if questions:
@@ -696,6 +844,7 @@ def serve_api():
     print(f"🌐 Starting API-only server...")
     print(f"🤖 Model: {current_model}")
     print(f"🔧 GPU: {gpu_type}")
+    print(f"📦 Using persistent volume for model storage")
     
     chat_func = get_chat_function(current_model)
     chat_func.remote(current_model, custom_questions=None, api_only=True)
@@ -708,6 +857,7 @@ def serve_demo():
     print(f"🧪 Starting API demo server (5 minutes)...")
     print(f"🤖 Model: {current_model}")
     print(f"🔧 GPU: {gpu_type}")
+    print(f"📦 Using persistent volume for model storage")
     
     chat_func = get_chat_function(current_model)
     chat_func.remote(current_model, custom_questions=[], api_only=False)
@@ -715,12 +865,12 @@ def serve_demo():
 @app.local_entrypoint()
 def test_large_model():
     """Test large model with automatic GPU selection"""
-    model_name = "unsloth/Meta-Llama-3.1-405B-bnb-4bit"
+    model_name = "unsloth/gemma-3-27b-it"
     print(f"🧪 Testing large model: {model_name}")
     
     chat_func = get_chat_function(model_name)
     chat_func.remote(model_name, [
-        "Hello! I'm testing a 70B model with automatic GPU selection.",
+        "Hello! I'm testing a 27B model with automatic GPU selection.",
         "What are the advantages of large language models?",
         "Write Python code for a binary search algorithm.",
         "Explain quantum computing in simple terms.",
@@ -745,19 +895,71 @@ def gpu_specs():
         ("B200", "192GB", "405B", "unsloth/Meta-Llama-3.1-405B-bnb-4bit"),
     ]
     
+    print("\n🔧 GPU | Memory | Model Size | Recommended Example")
+    print("-" * 80)
     for gpu, memory, models, example in specs:
-        print(f"\n🔧 {gpu:8} | {memory:7} | {models:15} | {example}")
+        print(f"{gpu:8} | {memory:7} | {models:15} | {example}")
     
     print(f"\n💡 Usage Examples:")
     print(f"  Small:   MODEL_NAME='TinyLlama/TinyLlama-1.1B-Chat-v1.0' modal run script.py::serve_api")
     print(f"  Medium:  MODEL_NAME='Qwen/Qwen2.5-3B-Instruct' modal run script.py::serve_api")
-    print(f"  Large:   MODEL_NAME='hugging-quants/Meta-Llama-3.1-70B-Instruct-GPTQ-INT4' modal run script.py::serve_api")
+    print(f"  Large:   MODEL_NAME='01-ai/Yi-1.5-6B-Chat' modal run script.py::serve_api")
+    print(f"  XL:      MODEL_NAME='unsloth/gemma-3-27b-it' modal run script.py::serve_api")
 
 @app.local_entrypoint()
-def download(model_name: str = DEFAULT_MODEL):
-    print(f"📥 Downloading model: {model_name}")
+def download(model_name: str = None):
+    """Download a model to persistent volume"""
+    if not model_name:
+        model_name = os.environ.get("MODEL_NAME", DEFAULT_MODEL)
+    
+    print(f"📥 Downloading model to persistent volume: {model_name}")
     result = download_model_remote.remote(model_name)
     print(result)
+
+@app.local_entrypoint()
+def list_files(model_name: str = None):
+    """List files in a model's volume"""
+    if not model_name:
+        model_name = os.environ.get("MODEL_NAME", DEFAULT_MODEL)
+    
+    result = list_model_files.remote(model_name)
+    print(result)
+
+@app.local_entrypoint()
+def delete_model(model_name: str = None):
+    """Delete a model from volume"""
+    if not model_name:
+        model_name = os.environ.get("MODEL_NAME", DEFAULT_MODEL)
+    
+    print(f"⚠️  Are you sure you want to delete {model_name}? This cannot be undone.")
+    confirm = input("Type 'yes' to confirm: ")
+    
+    if confirm.lower() == 'yes':
+        result = delete_model_from_volume.remote(model_name)
+        print(result)
+    else:
+        print("❌ Deletion cancelled")
+
+@app.local_entrypoint()
+def volumes():
+    """Show volume info"""
+    print("📦 Modal Volume Management")
+    print("=" * 50)
+    
+    print(f"\n📦 Volume Management:")
+    print(f"   All models stored in shared persistent volume")
+    print(f"   Models are cached between runs")
+    print(f"   No re-downloading after first use!")
+    
+    print(f"\n💡 Available commands:")
+    print(f"   download     - Download model to volume")
+    print(f"   list_files   - List files in model volume") 
+    print(f"   delete_model - Delete model from volume")
+    print(f"   volumes      - Show this info")
+    
+    print(f"\n🚀 Usage:")
+    print(f"   modal run script.py::download --model-name 'TinyLlama/TinyLlama-1.1B-Chat-v1.0'")
+    print(f"   modal run script.py::list_files --model-name 'TinyLlama/TinyLlama-1.1B-Chat-v1.0'")
 
 @app.local_entrypoint()
 def info():
@@ -765,7 +967,7 @@ def info():
     gpu_type, gpu_util = get_gpu_config(current_model)
     vllm_config = get_vllm_config(current_model, gpu_type)
     
-    print(f"🚀 vLLM v0.9.1 Configuration:")
+    print(f"🚀 vLLM v0.9.1 Configuration with Persistent Storage:")
     print(f"  Model: {current_model}")
     print(f"  GPU: {gpu_type} ({gpu_util*100}% memory)")
     print(f"  Max length: {vllm_config['max_model_len']}")
@@ -774,11 +976,25 @@ def info():
     if vllm_config['quantization']:
         print(f"  Quantization: {vllm_config['quantization']}")
     
+    print(f"\n📦 Volume Info:")
+    print(f"  Using persistent volume storage")
+    print(f"  Models persist between runs!")
+    print(f"  Shared volume for all models")
+    
     print(f"\n📋 Available Commands:")
-    print(f"  serve_api       - Run API server indefinitely")
-    print(f"  serve_demo      - Run API server for 5 minutes")
-    print(f"  chat            - Run chat demo + 5 min API")
-    print(f"  test_large_model - Test 70B model with auto GPU selection")
-    print(f"  gpu_specs       - Show all GPU specifications")
-    print(f"  download        - Download model only")
-    print(f"  info            - Show this configuration")
+    print(f"  serve_api        - Run API server indefinitely")
+    print(f"  serve_demo       - Run API server for 5 minutes")
+    print(f"  chat             - Run chat demo + 5 min API")
+    print(f"  download         - Download model to volume")
+    print(f"  list_files       - List model files in volume")
+    print(f"  delete_model     - Delete model from volume")
+    print(f"  volumes          - Show volume management info")
+    print(f"  gpu_specs        - Show all GPU specifications")
+    print(f"  test_large_model - Test 27B model with auto GPU selection")
+    print(f"  info             - Show this configuration")
+    
+    print(f"\n💾 Volume Benefits:")
+    print(f"  ✅ Models persist between runs - no re-downloading!")
+    print(f"  ✅ Faster startup times after first download")
+    print(f"  ✅ Bandwidth savings")
+    print(f"  ✅ Shared volume for efficient storage")
