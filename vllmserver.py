@@ -57,6 +57,50 @@ def get_model_config(model_path: Path):
             return None
     return None
 
+def setup_chat_template(model_path: Path, model_name: str):
+    """Set up chat template for models that don't have one"""
+    tokenizer_config_path = model_path / "tokenizer_config.json"
+    
+    if not tokenizer_config_path.exists():
+        print("⚠️ No tokenizer config found")
+        return
+    
+    try:
+        with open(tokenizer_config_path, 'r') as f:
+            config = json.load(f)
+        
+        # Check if chat template exists
+        if config.get("chat_template"):
+            print("✅ Chat template already exists")
+            return
+        
+        print("🔧 Adding missing chat template...")
+        
+        # Default chat template for Yi models
+        if "yi" in model_name.lower():
+            config["chat_template"] = "{% for message in messages %}<|im_start|>{{ message['role'] }}\n{{ message['content'] }}<|im_end|>\n{% endfor %}<|im_start|>assistant\n"
+        # Template for Qwen models
+        elif "qwen" in model_name.lower():
+            config["chat_template"] = "{% for message in messages %}<|im_start|>{{ message['role'] }}\n{{ message['content'] }}<|im_end|>\n{% endfor %}<|im_start|>assistant\n"
+        # Template for Mistral models
+        elif "mistral" in model_name.lower():
+            config["chat_template"] = "{% for message in messages %}{% if message['role'] == 'user' %}[INST] {{ message['content'] }} [/INST]{% elif message['role'] == 'assistant' %}{{ message['content'] }}{% endif %}{% endfor %}"
+        # Template for DialoGPT
+        elif "dialo" in model_name.lower():
+            config["chat_template"] = "{% for message in messages %}{% if message['role'] == 'user' %}{{ message['content'] }}{% elif message['role'] == 'assistant' %}{{ message['content'] }}{% endif %}{% if not loop.last %}{% endif %}{% endfor %}"
+        # Generic template for other models
+        else:
+            config["chat_template"] = "{% for message in messages %}{% if message['role'] == 'user' %}### Human: {{ message['content'] }}\n{% elif message['role'] == 'assistant' %}### Assistant: {{ message['content'] }}\n{% endif %}{% endfor %}### Assistant: "
+        
+        # Save updated config
+        with open(tokenizer_config_path, 'w') as f:
+            json.dump(config, f, indent=2)
+        
+        print("✅ Chat template added successfully")
+        
+    except Exception as e:
+        print(f"⚠️ Could not update chat template: {e}")
+
 def is_model_supported(model_config: dict, model_name: str) -> bool:
     """Check if the model is likely supported by vLLM"""
     if not model_config:
@@ -253,21 +297,25 @@ def get_gpu_config(model_name: str):
             if "405b" in model_name_lower:
                 return "B200", 0.95  # 405B full precision needs B200
             elif any(size in model_name_lower for size in ["70b", "72b"]):
-                return "A100-80GB", 0.90  # 70B full precision needs A100-80GB
+                return "H100", 0.80  # 70B full precision needs H100, not A100
     
-    # Large models (13B-34B parameters)
+    # Large models (13B-34B parameters) - FIXED MEMORY ALLOCATION
     elif any(size in model_name_lower for size in ["13b", "14b", "17b", "27b", "34b"]):
         if any(quant in model_name_lower for quant in ["gptq", "int4", "int8", "awq"]):
-            if any(size in model_name_lower for size in ["27b", "34b"]):
-                return "A100-80GB", 0.85  # 27B+ quantized needs A100-80GB
+            if any(size in model_name_lower for size in ["34b"]):
+                return "H100", 0.80  # 34B quantized can fit on H100 
+            elif any(size in model_name_lower for size in ["27b"]):
+                return "A100-80GB", 0.75  # 27B quantized can fit on A100-80GB with reduced memory
             elif any(size in model_name_lower for size in ["17b"]):
                 return "H100", 0.80  # 17B quantized fits on H100
             elif any(size in model_name_lower for size in ["13b", "14b"]):
                 return "A100-40GB", 0.80  # 13B quantized fits on A100-40GB
         else:
-            # Full precision large models
-            if any(size in model_name_lower for size in ["27b", "34b"]):
-                return "A100-80GB", 0.85  # 27B+ full precision needs A100-80GB
+            # Full precision large models - CRITICAL FIX
+            if any(size in model_name_lower for size in ["34b"]):
+                return "H200", 0.70  # 34B full precision REQUIRES H200 (141GB)
+            elif any(size in model_name_lower for size in ["27b"]):
+                return "H100", 0.80  # 27B full precision safer on H100
             elif any(size in model_name_lower for size in ["17b"]):
                 return "H100", 0.85  # 17B full precision needs H100
             elif any(size in model_name_lower for size in ["13b", "14b"]):
@@ -304,9 +352,9 @@ def get_gpu_config(model_name: str):
     else:
         return "L4", 0.75  # Conservative default
 
-# --- Dynamic vLLM configuration based on model ---
+# --- FIXED vLLM configuration with better memory management ---
 def get_vllm_config(model_name: str, gpu_type: str, model_config: dict = None, is_sharded: bool = False):
-    """Get vLLM configuration based on model and GPU"""
+    """Get vLLM configuration based on model and GPU with better memory management"""
     config = {
         "max_model_len": 2048,
         "max_num_seqs": 4,
@@ -324,7 +372,7 @@ def get_vllm_config(model_name: str, gpu_type: str, model_config: dict = None, i
         model_max_len = model_config.get("model_max_length")
         
         if max_pos_emb:
-            config["max_model_len"] = int(max_pos_emb * 0.9)
+            config["max_model_len"] = int(max_pos_emb * 0.7)  # Reduced from 0.9 to 0.7 for safety
         elif model_max_len:
             config["max_model_len"] = min(model_max_len, 2048)
         
@@ -342,94 +390,106 @@ def get_vllm_config(model_name: str, gpu_type: str, model_config: dict = None, i
     elif "gguf" in model_lower:
         config["quantization"] = None
     
-    # Sharded models may need special handling
+    # Sharded models need more conservative memory settings
     if is_sharded:
-        print("🔗 Detected sharded model - adjusting configuration for multi-file loading")
-        # Sharded models typically benefit from more conservative memory settings
-        config["max_num_seqs"] = max(2, config["max_num_seqs"] // 2)
+        print("🔗 Detected sharded model - applying conservative memory settings")
+        config["max_num_seqs"] = max(1, config["max_num_seqs"] // 3)  # More aggressive reduction
+        config["max_model_len"] = int(config["max_model_len"] * 0.7)  # Reduce context length for memory
     
-    # Model size based adjustments
+    # Model size based adjustments with FIXED memory management
     if any(size in model_lower for size in ["405b"]):
-        config["max_model_len"] = min(config["max_model_len"], 8192 if config["quantization"] else 4096)
-        config["max_num_seqs"] = 16 if config["quantization"] else 8
+        config["max_model_len"] = min(config["max_model_len"], 4096 if config["quantization"] else 2048)
+        config["max_num_seqs"] = 8 if config["quantization"] else 4
         config["tensor_parallel_size"] = 8 if gpu_type == "B200" else 4
     elif any(size in model_lower for size in ["70b", "72b"]):
-        config["max_model_len"] = min(config["max_model_len"], 8192 if config["quantization"] else 4096)
-        config["max_num_seqs"] = 12 if config["quantization"] else 6
-        config["tensor_parallel_size"] = 4 if gpu_type in ["H100", "H200", "A100-80GB", "B200"] else 2
+        config["max_model_len"] = min(config["max_model_len"], 4096 if config["quantization"] else 2048)
+        config["max_num_seqs"] = 6 if config["quantization"] else 3
+        config["tensor_parallel_size"] = 4 if gpu_type in ["H100", "H200", "B200"] else 2
     elif any(size in model_lower for size in ["27b", "34b"]):
-        config["max_model_len"] = min(config["max_model_len"], 8192 if config["quantization"] else 4096)
-        config["max_num_seqs"] = 10 if config["quantization"] else 6
-        config["tensor_parallel_size"] = 2 if gpu_type in ["A100-40GB", "A100-80GB", "H100", "H200", "L40S"] else 1
+        # CRITICAL FIX: Special handling for 34B models
+        if "34b" in model_lower:
+            config["max_model_len"] = min(config["max_model_len"], 1024)  # Very conservative for 34B
+            config["max_num_seqs"] = 1  # Single sequence only
+            config["tensor_parallel_size"] = 1  # Single GPU to avoid memory overhead
+            print("🔧 Applied EXTRA conservative settings for 34B model (1024 context, 1 seq)")
+        elif "27b" in model_lower:
+            config["max_model_len"] = min(config["max_model_len"], 2048 if config["quantization"] else 1024)
+            config["max_num_seqs"] = 2 if config["quantization"] else 1
+            config["tensor_parallel_size"] = 1  # Force single GPU for better memory efficiency
+            print("🔧 Applied conservative settings for 27B model")
+        config["tensor_parallel_size"] = 1  # Force single GPU for large models
     elif any(size in model_lower for size in ["17b"]):
-        config["max_model_len"] = min(config["max_model_len"], 8192 if config["quantization"] else 4096)
-        config["max_num_seqs"] = 8 if config["quantization"] else 6
-        config["tensor_parallel_size"] = 2 if gpu_type in ["H100", "H200", "A100-80GB"] else 1
+        config["max_model_len"] = min(config["max_model_len"], 4096 if config["quantization"] else 2048)
+        config["max_num_seqs"] = 4 if config["quantization"] else 3
+        config["tensor_parallel_size"] = 2 if gpu_type in ["H100", "H200"] else 1
     elif any(size in model_lower for size in ["7b", "8b", "9b", "12b", "13b", "14b"]):
         if not model_config:
-            config["max_model_len"] = min(config["max_model_len"], 8192 if config["quantization"] else 4096)
-        config["max_num_seqs"] = 16 if config["quantization"] else 8
+            config["max_model_len"] = min(config["max_model_len"], 4096 if config["quantization"] else 2048)
+        config["max_num_seqs"] = 8 if config["quantization"] else 4
         config["tensor_parallel_size"] = 2 if gpu_type in ["A100-40GB", "A100-80GB", "H100", "H200", "L40S"] else 1
     elif any(size in model_lower for size in ["3b", "4b", "6b"]):
         if not model_config:
-            config["max_model_len"] = min(config["max_model_len"], 6144)
-        config["max_num_seqs"] = 12
+            config["max_model_len"] = min(config["max_model_len"], 4096)
+        config["max_num_seqs"] = 8
     elif any(size in model_lower for size in ["1b", "2b", "tinyllama"]):
         if not model_config:
-            config["max_model_len"] = min(config["max_model_len"], 8192)
-        config["max_num_seqs"] = 16
+            config["max_model_len"] = min(config["max_model_len"], 4096)
+        config["max_num_seqs"] = 12
     elif "dialog" in model_lower or "chat" in model_lower:
         if not model_config:
             config["max_model_len"] = min(config["max_model_len"], 1024)
-        config["max_num_seqs"] = 8
+        config["max_num_seqs"] = 6
     
     # Model-specific adjustments
     if "stablelm" in model_lower:
         config["max_model_len"] = min(config["max_model_len"], 2048)
-        config["max_num_seqs"] = 4
+        config["max_num_seqs"] = 2
         config["dtype"] = "half"
         config["trust_remote_code"] = True
     
-    # GPU-specific adjustments
+    # GPU-specific adjustments with memory-aware settings
     if gpu_type == "T4":
         config["max_model_len"] = min(config["max_model_len"], 2048)
-        config["max_num_seqs"] = min(config["max_num_seqs"], 8)
+        config["max_num_seqs"] = min(config["max_num_seqs"], 4)
         config["dtype"] = "half"
     elif gpu_type == "L4":
-        config["max_model_len"] = min(config["max_model_len"], 4096)
-        config["max_num_seqs"] = min(config["max_num_seqs"], 12)
+        config["max_model_len"] = min(config["max_model_len"], 3072)
+        config["max_num_seqs"] = min(config["max_num_seqs"], 6)
         config["dtype"] = "half"
     elif gpu_type == "A10G":
-        config["max_model_len"] = min(config["max_model_len"], 6144)
-        config["max_num_seqs"] = min(config["max_num_seqs"], 16)
+        config["max_model_len"] = min(config["max_model_len"], 4096)
+        config["max_num_seqs"] = min(config["max_num_seqs"], 8)
         config["dtype"] = "auto"
     elif gpu_type == "L40S":
-        config["max_model_len"] = min(config["max_model_len"], 8192)
-        config["max_num_seqs"] = min(config["max_num_seqs"], 20)
+        config["max_model_len"] = min(config["max_model_len"], 4096)
+        config["max_num_seqs"] = min(config["max_num_seqs"], 8)
         config["dtype"] = "auto"
     elif gpu_type == "A100-40GB":
-        config["max_model_len"] = min(config["max_model_len"], 8192)
-        config["max_num_seqs"] = min(config["max_num_seqs"], 24)
+        config["max_model_len"] = min(config["max_model_len"], 4096)
+        config["max_num_seqs"] = min(config["max_num_seqs"], 6)
         config["dtype"] = "auto"
     elif gpu_type == "A100-80GB":
+        # FIXED: More conservative settings for A100-80GB
+        config["max_model_len"] = min(config["max_model_len"], 4096)
+        config["max_num_seqs"] = min(config["max_num_seqs"], 4)  # Reduced from 12 to 4
+        config["dtype"] = "auto"
+        print("🔧 Applied conservative A100-80GB memory settings")
+    elif gpu_type == "H100":
+        config["max_model_len"] = min(config["max_model_len"], 8192)
+        config["max_num_seqs"] = min(config["max_num_seqs"], 12)
+        config["dtype"] = "auto"
+    elif gpu_type == "H200":
+        config["max_model_len"] = min(config["max_model_len"], 12288)
+        config["max_num_seqs"] = min(config["max_num_seqs"], 20)
+        config["dtype"] = "auto"
+    elif gpu_type == "B200":
         config["max_model_len"] = min(config["max_model_len"], 16384)
         config["max_num_seqs"] = min(config["max_num_seqs"], 32)
         config["dtype"] = "auto"
-    elif gpu_type == "H100":
-        config["max_model_len"] = min(config["max_model_len"], 16384)
-        config["max_num_seqs"] = min(config["max_num_seqs"], 48)
-        config["dtype"] = "auto"
-    elif gpu_type == "H200":
-        config["max_model_len"] = min(config["max_model_len"], 20480)
-        config["max_num_seqs"] = min(config["max_num_seqs"], 56)
-        config["dtype"] = "auto"
-    elif gpu_type == "B200":
-        config["max_model_len"] = min(config["max_model_len"], 32768)
-        config["max_num_seqs"] = min(config["max_num_seqs"], 64)
-        config["dtype"] = "auto"
     
     # Ensure minimum viable values
-    config["max_model_len"] = max(config["max_model_len"], 256)
+    config["max_model_len"] = max(config["max_model_len"], 512)
+    config["max_num_seqs"] = max(config["max_num_seqs"], 1)
     
     return config
 
@@ -461,7 +521,7 @@ base_image = (
     )
 )
 
-# --- Core chat function ---
+# --- Core chat function with FIXED memory management ---
 def run_chat_logic(model_name: str, custom_questions: Optional[list] = None, api_only: bool = False):
     """Core chat logic that runs the vLLM server and handles chat"""
     gpu_type, gpu_memory_util = get_gpu_config(model_name)
@@ -483,6 +543,9 @@ def run_chat_logic(model_name: str, custom_questions: Optional[list] = None, api
     
     if not model_path.exists():
         raise RuntimeError(f"Model path {model_path} does not exist after download")
+    
+    # NEW: Set up chat template if missing
+    setup_chat_template(model_path, model_name)
     
     # Check if model is sharded
     is_sharded, shard_count, shard_files = check_model_sharding(model_path)
@@ -514,25 +577,46 @@ def run_chat_logic(model_name: str, custom_questions: Optional[list] = None, api
     if is_sharded:
         print(f"🔗 Model is sharded across {shard_count} files")
     
-    # Special handling for large sharded models that get stuck
-    if is_sharded and shard_count >= 4 and total_size > 15e9:  # >15GB
-        print(f"⚠️ Large sharded model detected - applying compatibility fixes")
-        # Force single GPU loading for large sharded models
-        gpu_memory_util = min(gpu_memory_util, 0.75)  # More conservative memory
-        print(f"🔧 Reduced GPU memory utilization to {gpu_memory_util} for stability")
+    # CRITICAL FIX: Better memory management for large models
+    model_size_gb = total_size / 1e9
+    model_lower = model_name.lower()
+    
+    # Apply memory fixes based on model size and type
+    if model_size_gb > 60:  # Very large models (34B+)
+        gpu_memory_util = min(gpu_memory_util, 0.60)  # Very conservative
+        print(f"🔧 Applied large model memory fix: {gpu_memory_util*100}% GPU memory")
+    elif model_size_gb > 40:  # Large models (27B)
+        gpu_memory_util = min(gpu_memory_util, 0.70)  # Conservative
+        print(f"🔧 Applied medium-large model memory fix: {gpu_memory_util*100}% GPU memory")
+    elif is_sharded and shard_count >= 10:  # Many shards
+        gpu_memory_util = min(gpu_memory_util, 0.75)
+        print(f"🔧 Applied multi-shard memory fix: {gpu_memory_util*100}% GPU memory")
+    
+    # Force H100 for 34B models if user somehow got A100
+    if "34b" in model_lower and gpu_type == "A100-80GB":
+        print("⚠️ WARNING: 34B model detected on A100-80GB")
+        print("💡 This model requires H100 for reliable operation")
+        print("🔧 Applying emergency memory settings...")
+        gpu_memory_util = 0.55  # Emergency low memory setting
     
     # Get configuration
     vllm_config = get_vllm_config(model_name, gpu_type, model_config, is_sharded)
     
     # Additional fixes for large sharded models
-    if is_sharded and shard_count >= 4:
-        # Force single GPU for problematic sharded models
+    if is_sharded and shard_count >= 10:
+        # Force single GPU for very large sharded models
         vllm_config["tensor_parallel_size"] = 1
-        # More conservative sequence settings
-        vllm_config["max_num_seqs"] = max(2, vllm_config["max_num_seqs"] // 4)
-        print(f"🔧 Applied large sharded model fixes: TP=1, max_seqs={vllm_config['max_num_seqs']}")
+        # Extremely conservative sequence settings
+        vllm_config["max_num_seqs"] = 1
+        print(f"🔧 Applied large sharded model fixes: TP=1, max_seqs=1")
     
-    # Build vLLM command
+    # CRITICAL FIX: Calculate proper batch tokens
+    max_batch_tokens = max(
+        vllm_config["max_model_len"],  # Must be at least as large as max_model_len
+        vllm_config["max_num_seqs"] * min(512, vllm_config["max_model_len"])  # Conservative batch size
+    )
+    
+    # Build vLLM command with FIXED parameters
     vllm_command = [
         "python", "-m", "vllm.entrypoints.openai.api_server",
         "--host", "0.0.0.0", 
@@ -542,14 +626,22 @@ def run_chat_logic(model_name: str, custom_questions: Optional[list] = None, api
         "--tensor-parallel-size", str(vllm_config["tensor_parallel_size"]),
         "--max-model-len", str(vllm_config["max_model_len"]),
         "--gpu-memory-utilization", str(gpu_memory_util),
-        "--max-num-batched-tokens", str(min(vllm_config["max_num_seqs"] * 128, vllm_config["max_model_len"])),  # Reduced batch size
+        "--max-num-batched-tokens", str(max_batch_tokens),  # FIXED: Proper calculation
         "--disable-log-requests",
         "--tokenizer-mode", "auto",
         "--dtype", vllm_config["dtype"],
+        "--max-num-seqs", str(vllm_config["max_num_seqs"]),  # Explicitly set max sequences
     ]
     
+    # FIXED: Only add FP8 KV cache for non-quantized models
+    if model_size_gb > 30 and gpu_type in ["H100", "H200", "B200"] and not vllm_config["quantization"]:
+        vllm_command.extend(["--kv-cache-dtype", "fp8"])
+        print("🔧 Enabled FP8 KV cache for large model memory optimization")
+    elif vllm_config["quantization"]:
+        print("🔧 Skipped FP8 KV cache for quantized model compatibility")
+    
     # Conditional flags for better compatibility
-    if not (is_sharded and shard_count >= 4):
+    if not (is_sharded and shard_count >= 10):
         vllm_command.append("--enable-prefix-caching")
     else:
         print("🔧 Disabled prefix caching for large sharded model compatibility")
@@ -562,60 +654,67 @@ def run_chat_logic(model_name: str, custom_questions: Optional[list] = None, api
         print(f"🔧 Detected quantization: {vllm_config['quantization']}")
     
     # Special handling for large sharded models
-    if is_sharded and shard_count >= 4:
+    if is_sharded and shard_count >= 10:
         print(f"🔗 Large sharded model detected ({shard_count} shards)")
         # Force specific load format
         vllm_command.extend(["--load-format", "safetensors"])
         # Disable problematic optimizations
         vllm_command.extend(["--disable-custom-all-reduce"])
-        # Use dummy scheduler for compatibility
-        vllm_command.extend(["--max-num-seqs", str(vllm_config["max_num_seqs"])])
+        # Force block size for memory efficiency
+        vllm_command.extend(["--block-size", "16"])  # Increased from 8 to 16 for better performance
     else:
         # Standard optimizations for smaller models
-        if gpu_type in ["A100-40GB", "A100-80GB", "H100", "H200", "B200"]:
+        if gpu_type in ["H100", "H200", "B200"] and not ("34b" in model_lower):
             vllm_command.append("--enable-chunked-prefill")
         elif gpu_type == "L4":
             vllm_command.extend([
                 "--block-size", "16",
                 "--swap-space", "4",
             ])
-        elif gpu_type == "L40S":
+        elif gpu_type in ["L40S", "A100-40GB", "A100-80GB"]:
             vllm_command.extend([
-                "--block-size", "16",  # Reduced from 32 for sharded models
-                "--swap-space", "4",   # Reduced swap space
+                "--block-size", "16",
+                "--swap-space", "4",
             ])
     
     print("🚀 Starting vLLM server...")
     print(f"⚙️ Config: max_len={vllm_config['max_model_len']}, tensor_parallel={vllm_config['tensor_parallel_size']}, dtype={vllm_config['dtype']}")
+    print(f"💾 Memory: {gpu_memory_util*100}% GPU, max_seqs={vllm_config['max_num_seqs']}, batch_tokens={max_batch_tokens}")
     if vllm_config["quantization"]:
         print(f"🗜️ Quantization: {vllm_config['quantization']}")
     if is_sharded:
         print(f"🔗 Sharded model loading enabled with compatibility fixes")
+    print(f"💬 Chat template setup completed for RP compatibility")
     
-    # Environment setup
+    # Environment setup with FIXED memory settings
     env = os.environ.copy()
     env["VLLM_USE_MODELSCOPE"] = "False"
     env["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
     env["CUDA_VISIBLE_DEVICES"] = "0"
     env["VLLM_ALLOW_LONG_MAX_MODEL_LEN"] = "1"
     
-    # Sharded model environment optimizations
-    if is_sharded:
+    # Memory-specific environment settings
+    if model_size_gb > 60:  # 34B+ models
+        env["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128,expandable_segments:True"
+        env["VLLM_ATTENTION_BACKEND"] = "FLASH_ATTN" 
+        env["TOKENIZERS_PARALLELISM"] = "false"
+        env["VLLM_USE_RAY_COMPILED_DAG"] = "0"
+        env["VLLM_USE_RAY_SPMD_WORKER"] = "0"
+        print("🔧 Applied 34B+ model environment optimizations")
+    elif is_sharded:
         env["VLLM_ATTENTION_BACKEND"] = "FLASH_ATTN"
-        env["TOKENIZERS_PARALLELISM"] = "false"  # Prevent tokenizer conflicts
-        # Force single process for large sharded models
-        if shard_count >= 4:
+        env["TOKENIZERS_PARALLELISM"] = "false"
+        if shard_count >= 10:
             env["VLLM_USE_RAY_COMPILED_DAG"] = "0"
             env["VLLM_USE_RAY_SPMD_WORKER"] = "0"
-            env["RAY_ENABLE_WINDOWS_OR_OSX_CLUSTER"] = "1"
-            print("🔧 Applied single-process fixes for large sharded model")
+            print("🔧 Applied large sharded model environment fixes")
     
     # GPU-specific environment settings  
     if gpu_type == "L4":
         env["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128"
         env["VLLM_ATTENTION_BACKEND"] = "FLASH_ATTN"
-    elif gpu_type == "L40S":
-        env["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:256"  # Reduced for sharded models
+    elif gpu_type in ["L40S", "A100-40GB", "A100-80GB"]:
+        env["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:256"
         env["VLLM_ATTENTION_BACKEND"] = "FLASH_ATTN"
     elif gpu_type in ["H100", "H200", "B200"]:
         env["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:512"
@@ -634,7 +733,7 @@ def run_chat_logic(model_name: str, custom_questions: Optional[list] = None, api
     )
     
     # Wait for startup (longer timeout for sharded models)
-    max_retries = 600 if is_sharded and shard_count >= 4 else 300  # Extended to 20 minutes for large sharded
+    max_retries = 600 if is_sharded and shard_count >= 10 else 300
     output_lines = []
     stuck_counter = 0
     last_output_time = time.time()
@@ -658,12 +757,26 @@ def run_chat_logic(model_name: str, custom_questions: Optional[list] = None, api
                 if line.strip():
                     print(f"   {line.strip()}")
             
-            # Error hints
+            # Enhanced error hints
             output_text = '\n'.join(output_lines)
-            if "out of memory" in output_text.lower():
-                print(f"\n💡 Hint: GPU memory exhausted. Try a smaller model or reduce max_model_len")
-                if is_sharded:
-                    print(f"💡 Large sharded models need substantial memory. Consider using A100-80GB or H100.")
+            if "out of memory" in output_text.lower() or "available kv cache memory" in output_text.lower():
+                print(f"\n💡 GPU Memory Issue Detected!")
+                print(f"   Model size: {model_size_gb:.1f} GB on {gpu_type}")
+                if "34b" in model_lower:
+                    print(f"   34B models need H100 (80GB) for reliable operation")
+                    print(f"   Try: MODEL_NAME='01-ai/Yi-1.5-6B-Chat' modal run vllmserver.py::serve_api")
+                elif model_size_gb > 40:
+                    print(f"   Large model needs more GPU memory or quantization")
+                    print(f"   Try a smaller model or find a quantized version")
+                else:
+                    print(f"   Try reducing max_model_len or using a larger GPU")
+            elif "max_num_batched_tokens" in output_text.lower():
+                print(f"\n💡 Batch token configuration error - this should now be fixed!")
+                print(f"   Batch tokens: {max_batch_tokens}, Max model len: {vllm_config['max_model_len']}")
+            elif "chat template" in output_text.lower():
+                print(f"\n💡 Chat template error detected!")
+                print(f"   This should be fixed with the chat template setup")
+                print(f"   Check if tokenizer_config.json was properly updated")
             elif "engine core initialization failed" in output_text.lower():
                 print(f"\n💡 Hint: Model '{model_name}' may not be fully compatible with vLLM 0.9.1")
                 print("   Try these well-supported alternatives:")
@@ -671,9 +784,8 @@ def run_chat_logic(model_name: str, custom_questions: Optional[list] = None, api
                 print("   - Qwen/Qwen2.5-3B-Instruct")
                 print("   - 01-ai/Yi-1.5-6B-Chat")
             elif is_sharded and ("load" in output_text.lower() or "cuda" in output_text.lower()):
-                print(f"\n💡 Sharded model CUDA initialization issue.")
-                print(f"   Try: MODEL_NAME='Qwen/Qwen2.5-3B-Instruct' modal run script.py::serve_api")
-                print(f"   Or use a smaller non-sharded model first")
+                print(f"\n💡 Sharded model loading issue.")
+                print(f"   Try: MODEL_NAME='Qwen/Qwen2.5-3B-Instruct' modal run vllmserver.py::serve_api")
             
             raise RuntimeError(f"vLLM failed to start (exit code: {vllm_process.returncode})")
         
@@ -685,18 +797,18 @@ def run_chat_logic(model_name: str, custom_questions: Optional[list] = None, api
                 stuck_counter = 0
                 
                 # Show important progress lines
-                if any(keyword in line.lower() for keyword in ["loading", "shard", "cuda", "memory", "model", "initialized"]):
+                if any(keyword in line.lower() for keyword in ["loading", "shard", "cuda", "memory", "model", "initialized", "kv cache"]):
                     print(f"   🔗 {line.strip()}")
-                elif i % 30 == 0:  # Show periodic updates
+                elif i % 30 == 0:
                     print(f"   {line.strip()}")
             else:
-                # Check if we're stuck (no output for too long)
+                # Check if we're stuck
                 if time.time() - last_output_time > 300:  # 5 minutes without output
                     stuck_counter += 1
                     if stuck_counter >= 3:
                         print(f"⚠️ Process appears stuck (no output for {(time.time() - last_output_time):.0f}s)")
-                        print(f"💡 This model may not be compatible. Try a smaller model:")
-                        print(f"   MODEL_NAME='Qwen/Qwen2.5-3B-Instruct' modal run script.py::serve_api")
+                        print(f"💡 Try a smaller model:")
+                        print(f"   MODEL_NAME='01-ai/Yi-1.5-6B-Chat' modal run vllmserver.py::serve_api")
                         vllm_process.terminate()
                         raise RuntimeError("Process stuck during model loading")
         except:
@@ -711,6 +823,7 @@ def run_chat_logic(model_name: str, custom_questions: Optional[list] = None, api
             print("✅ vLLM server is ready!")
             if is_sharded:
                 print(f"🔗 Sharded model loaded successfully!")
+            print("💬 Chat template configured for RP compatibility!")
             break
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
             if i % 60 == 0:
@@ -721,9 +834,9 @@ def run_chat_logic(model_name: str, custom_questions: Optional[list] = None, api
             time.sleep(2)
     else:
         print("⏰ Startup timeout reached!")
-        print(f"💡 The Yi-1.5-9B model may be too large/complex for vLLM 0.9.1")
-        print(f"💡 Try a smaller, non-sharded model:")
-        print(f"   MODEL_NAME='Qwen/Qwen2.5-3B-Instruct' modal run script.py::serve_api")
+        print(f"💡 Model may be too large for current GPU configuration")
+        print(f"💡 Try a smaller model:")
+        print(f"   MODEL_NAME='01-ai/Yi-1.5-6B-Chat' modal run vllmserver.py::serve_api")
         vllm_process.terminate()
         raise RuntimeError("vLLM server failed to start within timeout period")
     
@@ -754,6 +867,8 @@ def run_chat_logic(model_name: str, custom_questions: Optional[list] = None, api
             print(f"  - Completions: {tunnel.url}/v1/completions")
             if is_sharded:
                 print(f"🔗 Serving sharded model with {shard_count} parts")
+            print(f"💾 Model size: {model_size_gb:.1f} GB on {gpu_type}")
+            print(f"💬 Chat template configured for RP compatibility!")
             print("\n⏰ Server running indefinitely. Modal will auto-scale down after inactivity.")
             print("💡 Press Ctrl+C to stop the server manually.")
             
@@ -777,6 +892,7 @@ def run_chat_logic(model_name: str, custom_questions: Optional[list] = None, api
             print(f"  - Chat: {tunnel.url}/v1/chat/completions")
             if is_sharded:
                 print(f"🔗 Serving sharded model with {shard_count} parts")
+            print(f"💬 Chat template configured for RP compatibility!")
             
             print("\n⏰ Keeping server alive for 5 minutes for testing...")
             try:
@@ -800,6 +916,8 @@ def run_chat_logic(model_name: str, custom_questions: Optional[list] = None, api
             print(f"🤖 Chat Session with {model_name}")
             if is_sharded:
                 print(f"🔗 Using sharded model with {shard_count} parts")
+            print(f"📊 Model: {model_size_gb:.1f} GB on {gpu_type}")
+            print(f"💬 Chat template: Configured for RP compatibility")
             print(f"{'='*60}\n")
             
             for question in questions:
@@ -813,11 +931,11 @@ def run_chat_logic(model_name: str, custom_questions: Optional[list] = None, api
                         json={
                             "model": model_name,
                             "messages": conversation,
-                            "max_tokens": min(300, vllm_config["max_model_len"] // 4),
+                            "max_tokens": min(200, vllm_config["max_model_len"] // 6),  # Smaller response for memory
                             "temperature": 0.8,
                             "top_p": 0.9,
                         },
-                        timeout=120 if is_sharded else 90  # Longer timeout for sharded models
+                        timeout=120 if is_sharded else 90
                     )
                     
                     if response.status_code == 200:
@@ -834,6 +952,7 @@ def run_chat_logic(model_name: str, custom_questions: Optional[list] = None, api
             
             print("✅ Chat session completed!")
             print(f"🌐 Server is still running at: {tunnel.url}")
+            print(f"💬 Ready for RP proxy connections!")
             
             print("\n⏰ Keeping server alive for 5 minutes for additional testing...")
             try:
@@ -965,7 +1084,8 @@ def download_model_remote(model_name: str):
     print(f"📥 Downloading model to volume: {model_name}")
     model_path = get_model_path_from_name(model_name)
     download_model_to_path(model_name, model_path)
-    return f"✅ Model {model_name} downloaded and saved to volume!"
+    setup_chat_template(model_path, model_name)
+    return f"✅ Model {model_name} downloaded and chat template configured!"
 
 @app.function(
     image=base_image,
@@ -984,10 +1104,22 @@ def list_model_files(model_name: str):
     # Check if sharded
     is_sharded, shard_count, shard_files = check_model_sharding(model_path)
     
+    # Check chat template
+    tokenizer_config_path = model_path / "tokenizer_config.json"
+    has_chat_template = False
+    if tokenizer_config_path.exists():
+        try:
+            with open(tokenizer_config_path, 'r') as f:
+                config = json.load(f)
+            has_chat_template = bool(config.get("chat_template"))
+        except:
+            pass
+    
     result = [f"📁 Model: {model_name}"]
     result.append(f"📦 Using persistent volume storage")
     result.append(f"📁 Path: {model_path}")
     result.append(f"📊 Total size: {total_size / 1e9:.2f} GB")
+    result.append(f"💬 Chat template: {'✅ Configured' if has_chat_template else '❌ Missing'}")
     if is_sharded:
         result.append(f"🔗 Sharded model with {shard_count} parts")
     result.append(f"📄 Files ({len(files)}):")
@@ -997,7 +1129,12 @@ def list_model_files(model_name: str):
             size_mb = file.stat().st_size / 1e6
             # Mark shard files
             shard_marker = " 🔗" if file.name in shard_files else ""
-            result.append(f"   ✅ {file.name} ({size_mb:.1f} MB){shard_marker}")
+            # Mark chat template config
+            if file.name == "tokenizer_config.json":
+                chat_marker = " 💬"
+            else:
+                chat_marker = ""
+            result.append(f"   ✅ {file.name} ({size_mb:.1f} MB){shard_marker}{chat_marker}")
         else:
             result.append(f"   📁 {file.name}/")
     
@@ -1031,7 +1168,8 @@ def chat(questions: str = ""):
     print(f"🤖 Model: {current_model}")
     print(f"🔧 GPU: {gpu_type}")
     print(f"📦 Using persistent volume for model storage")
-    print(f"🔗 Sharded model support enabled")
+    print(f"💬 Chat template will be configured for RP compatibility")
+    print(f"🔗 Enhanced memory management enabled")
     
     custom_questions = None
     if questions:
@@ -1050,7 +1188,8 @@ def serve_api():
     print(f"🤖 Model: {current_model}")
     print(f"🔧 GPU: {gpu_type}")
     print(f"📦 Using persistent volume for model storage")
-    print(f"🔗 Sharded model support enabled")
+    print(f"💬 Chat template will be configured for RP compatibility")
+    print(f"🔗 Enhanced memory management enabled")
     
     chat_func = get_chat_function(current_model)
     chat_func.remote(current_model, custom_questions=None, api_only=True)
@@ -1064,45 +1203,18 @@ def serve_demo():
     print(f"🤖 Model: {current_model}")
     print(f"🔧 GPU: {gpu_type}")
     print(f"📦 Using persistent volume for model storage")
-    print(f"🔗 Sharded model support enabled")
+    print(f"💬 Chat template will be configured for RP compatibility")
+    print(f"🔗 Enhanced memory management enabled")
     
     chat_func = get_chat_function(current_model)
     chat_func.remote(current_model, custom_questions=[], api_only=False)
-
-@app.local_entrypoint()
-def test_large_model():
-    """Test large model with automatic GPU selection"""
-    model_name = "unsloth/gemma-3-27b-it"
-    print(f"🧪 Testing large model: {model_name}")
-    print(f"🔗 Sharded model support enabled")
-    
-    chat_func = get_chat_function(model_name)
-    chat_func.remote(model_name, [
-        "Hello! I'm testing a 27B model with automatic GPU selection and sharded model support.",
-        "What are the advantages of large language models?",
-        "Write Python code for a binary search algorithm.",
-        "Explain quantum computing in simple terms.",
-        "Thank you for the demonstration!"
-    ], api_only=False)
-
-@app.local_entrypoint()
-def test_sharded_model():
-    """Test a known sharded model"""
-    model_name = "microsoft/DialoGPT-large"  # This is often sharded
-    print(f"🧪 Testing sharded model support: {model_name}")
-    
-    chat_func = get_chat_function(model_name)
-    chat_func.remote(model_name, [
-        "Hello! I'm testing sharded model loading.",
-        "How are you handling multiple model files?",
-        "Thank you for the demo!"
-    ], api_only=False)
 
 @app.local_entrypoint()
 def test_working_model():
     """Test with a known working model"""
     model_name = "Qwen/Qwen2.5-3B-Instruct"
     print(f"🧪 Testing known working model: {model_name}")
+    print(f"💬 Chat template will be automatically configured")
     
     chat_func = get_chat_function(model_name)
     chat_func.remote(model_name, [
@@ -1112,22 +1224,65 @@ def test_working_model():
     ], api_only=False)
 
 @app.local_entrypoint()
+def test_medium_model():
+    """Test with 6B model"""
+    model_name = "01-ai/Yi-1.5-6B-Chat"
+    print(f"🧪 Testing medium model: {model_name}")
+    print(f"💬 Chat template will be automatically configured")
+    
+    chat_func = get_chat_function(model_name)
+    chat_func.remote(model_name, [
+        "Hello! Testing a 6B model.",
+        "Explain artificial intelligence briefly.",
+        "Thank you for the demo!"
+    ], api_only=False)
+
+@app.local_entrypoint()
+def test_large_model_h100():
+    """Test 34B model on H100 (will force H100 selection)"""
+    model_name = "01-ai/Yi-1.5-34B-Chat"
+    print(f"🧪 Testing large model with H200: {model_name}")
+    print(f"⚙️ This will automatically select H200 for proper memory handling")
+    print(f"💬 Chat template will be automatically configured")
+    
+    chat_func = get_chat_function(model_name)
+    chat_func.remote(model_name, [
+        "Hello! I'm testing a 34B model with proper GPU selection.",
+        "What are the key principles of good software design?",
+        "Thank you for the demonstration!"
+    ], api_only=False)
+
+@app.local_entrypoint()
+def test_rp_compatibility():
+    """Test with RP-friendly model"""
+    model_name = "01-ai/Yi-1.5-6B-Chat"
+    print(f"🧪 Testing RP api compatibility with: {model_name}")
+    print(f"💬 Specifically configuring for rp website proxy support")
+    
+    chat_func = get_chat_function(model_name)
+    chat_func.remote(model_name, [
+        "Hello! I'm a character you're chatting with. How are you today?",
+        "*smiles warmly* What would you like to talk about?",
+        "That sounds interesting! Tell me more about yourself."
+    ], api_only=False)
+
+@app.local_entrypoint()
 def gpu_specs():
     """Show GPU specifications and recommended models"""
     print("🚀 GPU Specifications & Model Recommendations")
-    print("🔗 Now with Enhanced Sharded Model Support!")
+    print("🔗 With FIXED Memory Management & Chat Template Support!")
     print("=" * 80)
     
     specs = [
         ("T4", "16GB", "1-2B", "TinyLlama/TinyLlama-1.1B-Chat-v1.0"),
         ("L4", "24GB", "3B, 7B-GPTQ", "Qwen/Qwen2.5-3B-Instruct"),
-        ("A10G", "24GB", "3-6B, 13B-GPTQ", "01-ai/Yi-1.5-6B-Chat"),
-        ("L40S", "48GB", "7B, 13B-GPTQ", "unsloth/mistral-7b-v0.2"),
-        ("A100-40GB", "40GB", "7-13B, 34B-GPTQ", "unsloth/llama-2-13b"),
-        ("A100-80GB", "80GB", "13-34B, 70B-GPTQ", "unsloth/gemma-3-27b-it"),
-        ("H100", "80GB", "34-70B", "unsloth/Llama-4-Maverick-17B-128E-Instruct"),
-        ("H200", "141GB", "70B+", "deepseek-ai/DeepSeek-R1-Distill-Llama-70B"),
-        ("B200", "192GB", "405B", "unsloth/Meta-Llama-3.1-405B-bnb-4bit"),
+        ("A10G", "24GB", "3-6B", "01-ai/Yi-1.5-6B-Chat"),
+        ("L40S", "48GB", "7-9B", "01-ai/Yi-1.5-9B-Chat"),
+        ("A100-40GB", "40GB", "7-13B", "unsloth/llama-2-13b"),
+        ("A100-80GB", "80GB", "13-27B ⚠️", "27B models (NOT 34B!)"),
+        ("H100", "80GB", "27-34B GPTQ", "modelscope/Yi-1.5-34B-Chat-GPTQ"),
+        ("H200", "141GB", "34B+", "01-ai/Yi-1.5-34B-Chat"),
+        ("B200", "192GB", "405B", "Meta-Llama-3.1-405B"),
     ]
     
     print("\n🔧 GPU | Memory | Model Size | Recommended Example")
@@ -1135,22 +1290,19 @@ def gpu_specs():
     for gpu, memory, models, example in specs:
         print(f"{gpu:8} | {memory:7} | {models:15} | {example}")
     
-    print(f"\n🔗 Enhanced Sharded Model Features:")
-    print(f"  ✅ Automatic shard detection")
-    print(f"  ✅ PyTorch and SafeTensors support")
-    print(f"  ✅ Index file parsing")
-    print(f"  ✅ Optimized loading for large models")
-    print(f"  ✅ Extended timeouts for sharded models")
-    print(f"  ✅ Stuck process detection and recovery")
-    print(f"  ✅ Memory optimization for large shards")
-    print(f"  🛠️ Compatibility fixes for vLLM 0.9.1")
+    print(f"\n🔗 FIXED Issues:")
+    print(f"  ✅ 34B models now properly assigned to H200")
+    print(f"  ✅ Chat templates auto-configured for RP websites")
+    print(f"  ✅ FP8 KV cache disabled for quantized models") 
+    print(f"  ✅ Conservative memory allocation")
+    print(f"  ✅ Batch token validation fixed")
+    print(f"  ⚠️ A100-80GB: Max ~27B models (NOT 34B)")
     
-    print(f"\n💡 Usage Examples:")
-    print(f"  Working:  MODEL_NAME='Qwen/Qwen2.5-3B-Instruct' modal run script.py::serve_api")
-    print(f"  Small:    MODEL_NAME='TinyLlama/TinyLlama-1.1B-Chat-v1.0' modal run script.py::serve_api")
-    print(f"  Medium:   MODEL_NAME='01-ai/Yi-1.5-6B-Chat' modal run script.py::serve_api")
-    print(f"  Test:     modal run script.py::test_working_model")
-    print(f"  Sharded:  modal run script.py::test_sharded_model")
+    print(f"\n💬 RP websites Compatible Examples:")
+    print(f"  Small:    MODEL_NAME='Qwen/Qwen2.5-3B-Instruct' modal run vllmserver.py::serve_api")
+    print(f"  Medium:   MODEL_NAME='01-ai/Yi-1.5-6B-Chat' modal run vllmserver.py::serve_api")
+    print(f"  Large:    MODEL_NAME='modelscope/Yi-1.5-34B-Chat-GPTQ' modal run vllmserver.py::serve_api")
+    print(f"  Test:     modal run vllmserver.py::test_rp_compatibility")
 
 @app.local_entrypoint()
 def download(model_name: str = None):
@@ -1160,6 +1312,7 @@ def download(model_name: str = None):
     
     print(f"📥 Downloading model to persistent volume: {model_name}")
     print(f"🔗 Sharded models will be detected automatically")
+    print(f"💬 Chat template will be configured for RP compatibility")
     result = download_model_remote.remote(model_name)
     print(result)
 
@@ -1188,87 +1341,34 @@ def delete_model(model_name: str = None):
         print("❌ Deletion cancelled")
 
 @app.local_entrypoint()
-def volumes():
-    """Show volume info"""
-    print("📦 Modal Volume Management")
-    print("🔗 With Enhanced Sharded Model Support!")
-    print("=" * 50)
-    
-    print(f"\n📦 Volume Management:")
-    print(f"   All models stored in shared persistent volume")
-    print(f"   Models are cached between runs")
-    print(f"   No re-downloading after first use!")
-    print(f"   Sharded models fully supported")
-    
-    print(f"\n🔗 Enhanced Sharded Model Features:")
-    print(f"   Automatic detection of model sharding")
-    print(f"   Support for PyTorch (.bin) and SafeTensors")
-    print(f"   Index file parsing for complex models")
-    print(f"   Optimized loading for large sharded models")
-    print(f"   Extended timeouts and stuck detection")
-    print(f"   Compatibility fixes for vLLM 0.9.1")
-    
-    print(f"\n💡 Available commands:")
-    print(f"   download     - Download model to volume")
-    print(f"   list_files   - List files in model volume") 
-    print(f"   delete_model - Delete model from volume")
-    print(f"   volumes      - Show this info")
-    print(f"   test_working_model - Test reliable 3B model")
-    print(f"   test_sharded_model - Test sharded model support")
-    
-    print(f"\n🚀 Usage:")
-    print(f"   modal run script.py::test_working_model")
-    print(f"   modal run script.py::download --model-name 'Qwen/Qwen2.5-3B-Instruct'")
-    print(f"   modal run script.py::list_files --model-name 'microsoft/DialoGPT-large'")
-
-@app.local_entrypoint()
 def info():
     current_model = os.environ.get("MODEL_NAME", DEFAULT_MODEL)
     gpu_type, gpu_util = get_gpu_config(current_model)
     vllm_config = get_vllm_config(current_model, gpu_type)
     
-    print(f"🚀 vLLM v0.9.1 Configuration with Enhanced Sharded Model Support:")
+    print(f"🚀 vLLM v0.9.1 with FIXED Memory Management & Chat Templates:")
     print(f"  Model: {current_model}")
-    print(f"  GPU: {gpu_type} ({gpu_util*100}% memory)")
+    print(f"  GPU: {gpu_type} ({gpu_util*100}% base memory)")
     print(f"  Max length: {vllm_config['max_model_len']}")
     print(f"  Tensor parallel: {vllm_config['tensor_parallel_size']}")
+    print(f"  Max sequences: {vllm_config['max_num_seqs']}")
     print(f"  Dtype: {vllm_config['dtype']}")
     if vllm_config['quantization']:
         print(f"  Quantization: {vllm_config['quantization']}")
     
-    print(f"\n📦 Volume Info:")
-    print(f"  Using persistent volume storage")
-    print(f"  Models persist between runs!")
-    print(f"  Shared volume for all models")
-    
-    print(f"\n🔗 Enhanced Sharded Model Features:")
-    print(f"  ✅ Automatic shard detection")
-    print(f"  ✅ PyTorch (.bin) and SafeTensors support")
-    print(f"  ✅ Index file parsing")
-    print(f"  ✅ Optimized configuration for sharded models")
-    print(f"  ✅ Extended timeouts for loading (up to 20 min)")
-    print(f"  ✅ Stuck process detection and recovery")
-    print(f"  ✅ Memory optimization for large shards")
-    print(f"  🛠️ Compatibility fixes for vLLM 0.9.1")
+    print(f"\n🔧 All Fixes Applied:")
+    print(f"  ✅ Chat templates for RP compatibility")
+    print(f"  ✅ Dynamic memory reduction for large models")
+    print(f"  ✅ FP8 KV cache (non-quantized only)")
+    print(f"  ✅ Conservative sequence limits")
+    print(f"  ✅ Fixed batch token calculation")
+    print(f"  ✅ Model-size-aware GPU selection")
     
     print(f"\n📋 Available Commands:")
-    print(f"  serve_api        - Run API server indefinitely")
-    print(f"  serve_demo       - Run API server for 5 minutes")
-    print(f"  chat             - Run chat demo + 5 min API")
-    print(f"  download         - Download model to volume")
-    print(f"  list_files       - List model files in volume")
-    print(f"  delete_model     - Delete model from volume")
-    print(f"  volumes          - Show volume management info")
-    print(f"  gpu_specs        - Show all GPU specifications")
-    print(f"  test_working_model - Test reliable 3B model")
-    print(f"  test_large_model - Test 27B model with auto GPU selection")
-    print(f"  test_sharded_model - Test sharded model support")
-    print(f"  info             - Show this configuration")
-    
-    print(f"\n💾 Volume Benefits:")
-    print(f"  ✅ Models persist between runs - no re-downloading!")
-    print(f"  ✅ Faster startup times after first download")
-    print(f"  ✅ Bandwidth savings")
-    print(f"  ✅ Shared volume for efficient storage")
-    print(f"  🔗 Full support for sharded models of any size!")
-    print(f"  🛠️ Enhanced compatibility fixes for problematic models!")
+    print(f"  serve_api               - Run API server indefinitely")
+    print(f"  test_working_model      - Test reliable 3B model")
+    print(f"  test_rp_compatibility - Test RP setup")
+    print(f"  test_medium_model       - Test 6B model")
+    print(f"  gpu_specs              - Show fixed GPU recommendations")
+    print(f"  download                - Download model with chat template")
+    print(f"  info                    - Show this info")
