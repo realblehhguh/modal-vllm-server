@@ -301,7 +301,7 @@ def get_gpu_config(model_name: str):
     
     # Large models (13B-34B parameters) - FIXED MEMORY ALLOCATION
     elif any(size in model_name_lower for size in ["13b", "14b", "17b", "27b", "34b"]):
-        if any(quant in model_name_lower for quant in ["gptq", "int4", "int8", "awq"]):
+        if any(quant in model_name_lower for quant in ["gptq", "int4", "int8", "awq", "bnb"]):
             if any(size in model_name_lower for size in ["34b"]):
                 return "H100", 0.80  # 34B quantized can fit on H100 
             elif any(size in model_name_lower for size in ["27b"]):
@@ -323,7 +323,7 @@ def get_gpu_config(model_name: str):
     
     # Medium-large models (7B-12B parameters)
     elif any(size in model_name_lower for size in ["7b", "8b", "9b", "12b"]):
-        if any(quant in model_name_lower for quant in ["gptq", "int4", "int8", "awq"]):
+        if any(quant in model_name_lower for quant in ["gptq", "int4", "int8", "awq", "bnb"]):
             return "L40S", 0.75   # 7B-12B quantized fits on L40S
         else:
             # Full precision medium-large models
@@ -378,15 +378,21 @@ def get_vllm_config(model_name: str, gpu_type: str, model_config: dict = None, i
         
         print(f"🔧 Adjusted max_model_len to {config['max_model_len']} based on model config")
     
-    # Detect quantization
+    # FIXED: Detect quantization correctly
     if "gptq" in model_lower:
         config["quantization"] = "gptq"
     elif "awq" in model_lower:
         config["quantization"] = "awq"
-    elif "int4" in model_lower or "bnb" in model_lower:
-        config["quantization"] = "gptq"
+    elif "bnb" in model_lower or "bitsandbytes" in model_lower:
+        config["quantization"] = "bitsandbytes"
+    elif "int4" in model_lower:
+        # Check if it's BnB or GPTQ based on model name
+        if "bnb" in model_lower or "bitsandbytes" in model_lower:
+            config["quantization"] = "bitsandbytes"
+        else:
+            config["quantization"] = "gptq"
     elif "int8" in model_lower:
-        config["quantization"] = "gptq"
+        config["quantization"] = "bitsandbytes"
     elif "gguf" in model_lower:
         config["quantization"] = None
     
@@ -518,6 +524,7 @@ base_image = (
         "protobuf",
         "psutil",
         "pynvml",
+        "bitsandbytes>=0.43.0",  # Added for BnB quantization support
     )
 )
 
@@ -638,7 +645,7 @@ def run_chat_logic(model_name: str, custom_questions: Optional[list] = None, api
         vllm_command.extend(["--kv-cache-dtype", "fp8"])
         print("🔧 Enabled FP8 KV cache for large model memory optimization")
     elif vllm_config["quantization"]:
-        print("🔧 Skipped FP8 KV cache for quantized model compatibility")
+        print(f"🔧 Skipped FP8 KV cache for {vllm_config['quantization']} quantization compatibility")
     
     # Conditional flags for better compatibility
     if not (is_sharded and shard_count >= 10):
@@ -777,6 +784,11 @@ def run_chat_logic(model_name: str, custom_questions: Optional[list] = None, api
                 print(f"\n💡 Chat template error detected!")
                 print(f"   This should be fixed with the chat template setup")
                 print(f"   Check if tokenizer_config.json was properly updated")
+            elif "quantization" in output_text.lower() and "does not match" in output_text.lower():
+                print(f"\n💡 Quantization mismatch detected!")
+                print(f"   Model uses different quantization than detected")
+                print(f"   Detected: {vllm_config['quantization']}")
+                print(f"   Try without quantization override or use a different model")
             elif "engine core initialization failed" in output_text.lower():
                 print(f"\n💡 Hint: Model '{model_name}' may not be fully compatible with vLLM 0.9.1")
                 print("   Try these well-supported alternatives:")
@@ -869,6 +881,7 @@ def run_chat_logic(model_name: str, custom_questions: Optional[list] = None, api
                 print(f"🔗 Serving sharded model with {shard_count} parts")
             print(f"💾 Model size: {model_size_gb:.1f} GB on {gpu_type}")
             print(f"💬 Chat template configured for RP compatibility!")
+            print(f"🗜️ Quantization: {vllm_config['quantization']}")
             print("\n⏰ Server running indefinitely. Modal will auto-scale down after inactivity.")
             print("💡 Press Ctrl+C to stop the server manually.")
             
@@ -893,6 +906,7 @@ def run_chat_logic(model_name: str, custom_questions: Optional[list] = None, api
             if is_sharded:
                 print(f"🔗 Serving sharded model with {shard_count} parts")
             print(f"💬 Chat template configured for RP compatibility!")
+            print(f"🗜️ Quantization: {vllm_config['quantization']}")
             
             print("\n⏰ Keeping server alive for 5 minutes for testing...")
             try:
@@ -918,6 +932,7 @@ def run_chat_logic(model_name: str, custom_questions: Optional[list] = None, api
                 print(f"🔗 Using sharded model with {shard_count} parts")
             print(f"📊 Model: {model_size_gb:.1f} GB on {gpu_type}")
             print(f"💬 Chat template: Configured for RP compatibility")
+            print(f"🗜️ Quantization: {vllm_config['quantization']}")
             print(f"{'='*60}\n")
             
             for question in questions:
@@ -953,6 +968,7 @@ def run_chat_logic(model_name: str, custom_questions: Optional[list] = None, api
             print("✅ Chat session completed!")
             print(f"🌐 Server is still running at: {tunnel.url}")
             print(f"💬 Ready for RP proxy connections!")
+            print(f"🗜️ Using {vllm_config['quantization']} quantization")
             
             print("\n⏰ Keeping server alive for 5 minutes for additional testing...")
             try:
@@ -1014,7 +1030,7 @@ def run_chat_a100_40gb(model_name: str, custom_questions: Optional[list] = None,
     return run_chat_logic(model_name, custom_questions, api_only)
 
 @app.function(
-    gpu="A100:8", 
+    gpu="A100-80GB", 
     image=base_image, 
     secrets=[modal.Secret.from_name("huggingface")], 
     timeout=3600,
@@ -1170,6 +1186,7 @@ def chat(questions: str = ""):
     print(f"📦 Using persistent volume for model storage")
     print(f"💬 Chat template will be configured for RP compatibility")
     print(f"🔗 Enhanced memory management enabled")
+    print(f"🗜️ Fixed quantization detection (BnB/GPTQ/AWQ)")
     
     custom_questions = None
     if questions:
@@ -1190,6 +1207,7 @@ def serve_api():
     print(f"📦 Using persistent volume for model storage")
     print(f"💬 Chat template will be configured for RP compatibility")
     print(f"🔗 Enhanced memory management enabled")
+    print(f"🗜️ Fixed quantization detection (BnB/GPTQ/AWQ)")
     
     chat_func = get_chat_function(current_model)
     chat_func.remote(current_model, custom_questions=None, api_only=True)
@@ -1205,6 +1223,7 @@ def serve_demo():
     print(f"📦 Using persistent volume for model storage")
     print(f"💬 Chat template will be configured for RP compatibility")
     print(f"🔗 Enhanced memory management enabled")
+    print(f"🗜️ Fixed quantization detection (BnB/GPTQ/AWQ)")
     
     chat_func = get_chat_function(current_model)
     chat_func.remote(current_model, custom_questions=[], api_only=False)
@@ -1256,8 +1275,8 @@ def test_large_model_h100():
 def test_rp_compatibility():
     """Test with RP-friendly model"""
     model_name = "01-ai/Yi-1.5-6B-Chat"
-    print(f"🧪 Testing RP api compatibility with: {model_name}")
-    print(f"💬 Specifically configuring for rp website proxy support")
+    print(f"🧪 Testing RP compatibility with: {model_name}")
+    print(f"💬 Specifically configuring for RP proxy support")
     
     chat_func = get_chat_function(model_name)
     chat_func.remote(model_name, [
@@ -1267,10 +1286,25 @@ def test_rp_compatibility():
     ], api_only=False)
 
 @app.local_entrypoint()
+def test_bnb_quantization():
+    """Test BitsAndBytes quantized model"""
+    model_name = "unsloth/Qwen2.5-14B-Instruct-bnb-4bit"
+    print(f"🧪 Testing BnB quantized model: {model_name}")
+    print(f"🗜️ This should now detect BitsAndBytes quantization correctly")
+    print(f"💬 Chat template will be automatically configured")
+    
+    chat_func = get_chat_function(model_name)
+    chat_func.remote(model_name, [
+        "Hello! Testing BitsAndBytes 4-bit quantization.",
+        "What are the benefits of model quantization?",
+        "Thank you for demonstrating quantization!"
+    ], api_only=False)
+
+@app.local_entrypoint()
 def gpu_specs():
     """Show GPU specifications and recommended models"""
     print("🚀 GPU Specifications & Model Recommendations")
-    print("🔗 With FIXED Memory Management & Chat Template Support!")
+    print("🔗 With FIXED Memory Management, Chat Templates & Quantization Support!")
     print("=" * 80)
     
     specs = [
@@ -1279,7 +1313,7 @@ def gpu_specs():
         ("A10G", "24GB", "3-6B", "01-ai/Yi-1.5-6B-Chat"),
         ("L40S", "48GB", "7-9B", "01-ai/Yi-1.5-9B-Chat"),
         ("A100-40GB", "40GB", "7-13B", "unsloth/llama-2-13b"),
-        ("A100-80GB", "80GB", "13-27B ⚠️", "27B models (NOT 34B!)"),
+        ("A100-80GB", "80GB", "13-14B BnB", "unsloth/Qwen2.5-14B-Instruct-bnb-4bit"),
         ("H100", "80GB", "27-34B GPTQ", "modelscope/Yi-1.5-34B-Chat-GPTQ"),
         ("H200", "141GB", "34B+", "01-ai/Yi-1.5-34B-Chat"),
         ("B200", "192GB", "405B", "Meta-Llama-3.1-405B"),
@@ -1292,17 +1326,19 @@ def gpu_specs():
     
     print(f"\n🔗 FIXED Issues:")
     print(f"  ✅ 34B models now properly assigned to H200")
-    print(f"  ✅ Chat templates auto-configured for RP websites")
+    print(f"  ✅ Chat templates auto-configured for RP compatibility")
     print(f"  ✅ FP8 KV cache disabled for quantized models") 
     print(f"  ✅ Conservative memory allocation")
     print(f"  ✅ Batch token validation fixed")
-    print(f"  ⚠️ A100-80GB: Max ~27B models (NOT 34B)")
+    print(f"  ✅ BitsAndBytes quantization detection fixed")
+    print(f"  ⚠️ A100-80GB: Max ~14B BnB models recommended")
     
-    print(f"\n💬 RP websites Compatible Examples:")
-    print(f"  Small:    MODEL_NAME='Qwen/Qwen2.5-3B-Instruct' modal run vllmserver.py::serve_api")
-    print(f"  Medium:   MODEL_NAME='01-ai/Yi-1.5-6B-Chat' modal run vllmserver.py::serve_api")
-    print(f"  Large:    MODEL_NAME='modelscope/Yi-1.5-34B-Chat-GPTQ' modal run vllmserver.py::serve_api")
-    print(f"  Test:     modal run vllmserver.py::test_rp_compatibility")
+    print(f"\n💬 RP Compatible Examples:")
+    print(f"  Small:      MODEL_NAME='Qwen/Qwen2.5-3B-Instruct' modal run vllmserver.py::serve_api")
+    print(f"  Medium:     MODEL_NAME='01-ai/Yi-1.5-6B-Chat' modal run vllmserver.py::serve_api")
+    print(f"  Large:      MODEL_NAME='modelscope/Yi-1.5-34B-Chat-GPTQ' modal run vllmserver.py::serve_api")
+    print(f"  BnB Quant:  MODEL_NAME='unsloth/Qwen2.5-14B-Instruct-bnb-4bit' modal run vllmserver.py::serve_api")
+    print(f"  Test:       modal run vllmserver.py::test_bnb_quantization")
 
 @app.local_entrypoint()
 def download(model_name: str = None):
@@ -1313,6 +1349,7 @@ def download(model_name: str = None):
     print(f"📥 Downloading model to persistent volume: {model_name}")
     print(f"🔗 Sharded models will be detected automatically")
     print(f"💬 Chat template will be configured for RP compatibility")
+    print(f"🗜️ Quantization will be properly detected")
     result = download_model_remote.remote(model_name)
     print(result)
 
@@ -1346,7 +1383,7 @@ def info():
     gpu_type, gpu_util = get_gpu_config(current_model)
     vllm_config = get_vllm_config(current_model, gpu_type)
     
-    print(f"🚀 vLLM v0.9.1 with FIXED Memory Management & Chat Templates:")
+    print(f"🚀 vLLM v0.9.1 with FIXED Memory Management, Chat Templates & Quantization:")
     print(f"  Model: {current_model}")
     print(f"  GPU: {gpu_type} ({gpu_util*100}% base memory)")
     print(f"  Max length: {vllm_config['max_model_len']}")
@@ -1363,11 +1400,13 @@ def info():
     print(f"  ✅ Conservative sequence limits")
     print(f"  ✅ Fixed batch token calculation")
     print(f"  ✅ Model-size-aware GPU selection")
+    print(f"  ✅ BitsAndBytes/GPTQ/AWQ quantization detection")
     
     print(f"\n📋 Available Commands:")
     print(f"  serve_api               - Run API server indefinitely")
     print(f"  test_working_model      - Test reliable 3B model")
-    print(f"  test_rp_compatibility - Test RP setup")
+    print(f"  test_rp_compatibility   - Test RP setup")
+    print(f"  test_bnb_quantization   - Test BnB quantized model")
     print(f"  test_medium_model       - Test 6B model")
     print(f"  gpu_specs              - Show fixed GPU recommendations")
     print(f"  download                - Download model with chat template")
